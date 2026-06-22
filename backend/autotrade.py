@@ -1,0 +1,545 @@
+import asyncio
+import MetaTrader5 as mt5
+from datetime import datetime, timezone, timedelta
+import random
+import pandas as pd
+
+from database import db
+from mt5_logic import get_market_data, calculate_indicators, analyze_exit_conditions
+from routes_orders import calc_pnl, execute_mt5_order, close_mt5_order
+
+# Track the last timestamp traded per symbol to avoid opening duplicate trades
+# Structure: {"username_symbol": unix_timestamp}
+last_traded_signals = {}
+
+# Track consecutive losses per user for cooldown
+# Structure: {"username": {"count": int, "last_loss_time": datetime}}
+consecutive_losses = {}
+
+# Track daily PnL per user
+# Structure: {"username": {"date": "YYYY-MM-DD", "pnl": float}}
+daily_pnl_tracker = {}
+
+# Active symbols to monitor for signals
+MONITOR_SYMBOLS = ["XAUUSD", "EURUSD", "GBPUSD", "USDJPY", "AUDUSD"]
+DEFAULT_LOT_SIZE = 0.05
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  RISK MANAGEMENT CONSTANTS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+MAX_OPEN_TRADES_PER_SYMBOL = 1    # Max 1 trade per symbol at a time
+DAILY_LOSS_LIMIT_PCT = 3.0         # Stop trading if daily loss > 3% of balance
+CONSECUTIVE_LOSS_COOLDOWN = 3      # After 3 consecutive losses...
+COOLDOWN_MINUTES = 15              # ...wait 15 minutes before next trade
+MAX_TRADE_AGE_CANDLES = 60         # Close stale trades after 60 candles (5 hours on M5)
+FLAT_TRADE_CANDLES = 20            # Close if in profit but flat for 20 candles
+MAX_SPREAD_MULTIPLIER = 2.0       # Don't trade if spread > 2× average
+
+# Trailing stop stages (in ATR multiples)
+TRAIL_STAGE_1_TRIGGER = 1.0   # Price reaches 1.0× ATR profit → SL to breakeven
+TRAIL_STAGE_2_TRIGGER = 1.5   # Price reaches 1.5× ATR profit → SL to +0.5× ATR
+TRAIL_STAGE_3_TRIGGER = 2.0   # Price reaches 2.0× ATR profit → SL to +1.0× ATR
+TRAIL_CONTINUOUS_OFFSET = 1.0  # After stage 3: always trail at 1.0× ATR behind
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  RISK CHECKS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+async def check_max_trades_per_symbol(username: str, symbol: str) -> bool:
+    """Returns True if we can open a new trade (under limit)."""
+    count = await db.orders.count_documents({
+        "username": username,
+        "symbol": symbol,
+        "status": "open"
+    })
+    return count < MAX_OPEN_TRADES_PER_SYMBOL
+
+
+async def check_daily_loss_limit(username: str) -> bool:
+    """Returns True if we're within daily loss limit and can trade."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    
+    tracker = daily_pnl_tracker.get(username, {})
+    if tracker.get("date") != today:
+        # Reset for new day
+        daily_pnl_tracker[username] = {"date": today, "pnl": 0.0}
+        return True
+    
+    funds = await db.funds.find_one({"username": username})
+    if not funds:
+        return True
+    
+    balance = funds.get("balance", 100000)
+    daily_loss = tracker.get("pnl", 0.0)
+    max_loss = balance * (DAILY_LOSS_LIMIT_PCT / 100)
+    
+    if daily_loss < -max_loss:
+        print(f"[AutoTrade] ⛔ Daily loss limit hit for {username}: ${daily_loss:.2f} / -${max_loss:.2f}")
+        return False
+    
+    return True
+
+
+def check_consecutive_loss_cooldown(username: str) -> bool:
+    """Returns True if we're past cooldown period after consecutive losses."""
+    tracker = consecutive_losses.get(username, {"count": 0, "last_loss_time": None})
+    
+    if tracker["count"] >= CONSECUTIVE_LOSS_COOLDOWN:
+        if tracker["last_loss_time"]:
+            cooldown_end = tracker["last_loss_time"] + timedelta(minutes=COOLDOWN_MINUTES)
+            if datetime.now(timezone.utc) < cooldown_end:
+                remaining = (cooldown_end - datetime.now(timezone.utc)).seconds // 60
+                print(f"[AutoTrade] ⏳ Cooldown active for {username}: {remaining}m remaining after {tracker['count']} consecutive losses")
+                return False
+            else:
+                # Cooldown expired, reset
+                consecutive_losses[username] = {"count": 0, "last_loss_time": None}
+    
+    return True
+
+
+def check_spread(symbol: str) -> bool:
+    """Returns True if spread is acceptable (not during news/high volatility)."""
+    tick = mt5.symbol_info_tick(symbol)
+    info = mt5.symbol_info(symbol)
+    
+    if not tick or not info:
+        return False
+    
+    spread = tick.ask - tick.bid
+    
+    # Get typical spread from symbol info (in points)
+    point = info.point if info.point > 0 else 0.01
+    spread_points = spread / point
+    typical_spread = info.spread  # MT5's reported typical spread
+    
+    if typical_spread > 0 and spread_points > typical_spread * MAX_SPREAD_MULTIPLIER:
+        print(f"[AutoTrade] ⚠️ High spread on {symbol}: {spread_points:.0f} pts (typical: {typical_spread} pts) — SKIPPING")
+        return False
+    
+    return True
+
+
+def record_trade_result(username: str, pnl: float):
+    """Track wins/losses for consecutive loss cooldown and daily PnL."""
+    # Daily PnL tracking
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if username not in daily_pnl_tracker:
+        daily_pnl_tracker[username] = {"date": today, "pnl": 0.0}
+    if daily_pnl_tracker[username].get("date") != today:
+        daily_pnl_tracker[username] = {"date": today, "pnl": 0.0}
+    daily_pnl_tracker[username]["pnl"] += pnl
+    
+    # Consecutive loss tracking
+    if username not in consecutive_losses:
+        consecutive_losses[username] = {"count": 0, "last_loss_time": None}
+    
+    if pnl < 0:
+        consecutive_losses[username]["count"] += 1
+        consecutive_losses[username]["last_loss_time"] = datetime.now(timezone.utc)
+    else:
+        consecutive_losses[username]["count"] = 0  # Reset on win
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  TRADE EXECUTION
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+async def execute_trade(username: str, symbol: str, order_type: str, candle: pd.Series):
+    """Executes a trade and saves it to the database."""
+    tick = mt5.symbol_info_tick(symbol)
+    if not tick:
+        return
+        
+    open_price = tick.ask if order_type == "BUY" else tick.bid
+    
+    # Simple margin logic
+    funds = await db.funds.find_one({"username": username})
+    if not funds:
+        return # Cannot trade without a funds document
+
+    # Store ATR value for trailing stop calculations
+    atr_val = float(candle['atr']) if pd.notna(candle.get('atr')) else None
+    
+    sl_val = float(candle['sl']) if pd.notna(candle['sl']) else None
+    tp_val = float(candle['tp']) if pd.notna(candle['tp']) else None
+
+    # Execute trade in MT5
+    mt5_result = execute_mt5_order(
+        symbol=symbol,
+        order_type=order_type,
+        lot_size=DEFAULT_LOT_SIZE,
+        price=open_price,
+        sl=sl_val,
+        tp=tp_val,
+        comment="Auto BOT v2"
+    )
+    
+    if mt5_result["success"]:
+        ticket = mt5_result["ticket"]
+        executed_price = mt5_result["price"]
+    else:
+        print(f"[AutoTrade] ⚠️ MT5 execution failed: {mt5_result['error']}, falling back to dummy trading")
+        ticket = str(random.randint(10000000, 99999999))
+        executed_price = open_price
+
+    order = {
+        "ticket": ticket,
+        "username": username,
+        "symbol": symbol,
+        "order_type": order_type,
+        "lot_size": DEFAULT_LOT_SIZE,
+        "open_price": executed_price,
+        "current_price": executed_price,
+        "sl": sl_val,
+        "tp": tp_val,
+        "original_sl": sl_val,  # Keep original SL
+        "atr_at_entry": atr_val,  # ATR at entry time for trailing calculations
+        "pnl": 0.0,
+        "floating_pnl": 0.0,
+        "commission": -0.50, # Simple fixed dummy commission
+        "swap": 0.0,
+        "status": "open",
+        "comment": "Auto BOT v2",
+        "open_time": datetime.now(timezone.utc).isoformat(),
+        "open_candle_count": 0,  # Track how many candles this trade has been open
+        "trail_stage": 0,  # 0=initial, 1=breakeven, 2=+0.5ATR, 3=+1ATR, 4=continuous
+        "close_time": None,
+        "close_price": None,
+    }
+    
+    await db.orders.insert_one(order)
+    print(f"[AutoTrade] ✅ Opened {order_type} on {symbol} at {open_price} for {username} (Ticket: {ticket}) | SL: {order['sl']} | TP: {order['tp']}")
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  SIGNAL SCANNING WITH RISK CHECKS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+async def scan_for_signals():
+    """Scans enabled symbols per user for new GUARDEER PRO v2 signals with risk management."""
+    users = await db.users.find({}).to_list(1000)
+    if not users:
+        return
+        
+    for user in users:
+        username = user['username']
+        symbols = user.get("autotrade_symbols", [])
+        
+        # ── RISK CHECK 1: Daily loss limit ──
+        if not await check_daily_loss_limit(username):
+            continue
+        
+        # ── RISK CHECK 2: Consecutive loss cooldown ──
+        if not check_consecutive_loss_cooldown(username):
+            continue
+        
+        for symbol in symbols:
+            # ── RISK CHECK 3: Max trades per symbol ──
+            if not await check_max_trades_per_symbol(username, symbol):
+                continue
+            
+            # ── RISK CHECK 4: Spread check ──
+            if not check_spread(symbol):
+                continue
+            
+            df = get_market_data(symbol, mt5.TIMEFRAME_M5, 300)
+            if df is None or len(df) == 0:
+                continue
+                
+            df = calculate_indicators(df, symbol=symbol)
+            if df is None or len(df) == 0:
+                continue
+                
+            latest = df.iloc[-1]
+            sig = latest['signal']
+            
+            # If there is an active signal on the latest candle
+            if pd.notna(sig) and sig in ('BUY', 'SELL'):
+                signal_time = int(latest['raw_time'])
+                
+                key = f"{username}_{symbol}"
+                
+                # Check if we already traded this specific signal (on this candle)
+                if last_traded_signals.get(key) != signal_time:
+                    last_traded_signals[key] = signal_time
+                    await execute_trade(username, symbol, sig, latest)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  SMART POSITION MANAGEMENT
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+async def close_position(order: dict, current_price: float, reason: str):
+    """Close a position and update all records."""
+    open_price = order["open_price"]
+    symbol = order["symbol"]
+    ticket = order["ticket"]
+    
+    # Try closing in MT5
+    try:
+        mt5_ticket = int(ticket)
+        close_result = close_mt5_order(
+            symbol=symbol,
+            ticket=mt5_ticket,
+            order_type=order["order_type"],
+            lot_size=order["lot_size"],
+            close_price=current_price
+        )
+        if close_result["success"]:
+            actual_close_price = close_result["price"]
+        else:
+            print(f"[AutoTrade] ⚠️ MT5 close failed: {close_result['error']}")
+            actual_close_price = current_price
+    except ValueError:
+        # Ticket was generated as string for dummy order
+        actual_close_price = current_price
+
+    pnl = calc_pnl(order["order_type"], open_price, actual_close_price, order["lot_size"], symbol)
+    net_pnl = pnl + order.get("commission", 0) + order.get("swap", 0)
+    
+    await db.orders.update_one(
+        {"_id": order["_id"]},
+        {"$set": {
+            "status": "closed",
+            "close_price": actual_close_price,
+            "close_time": datetime.now(timezone.utc).isoformat(),
+            "current_price": actual_close_price,
+            "pnl": pnl,
+            "floating_pnl": 0.0,
+            "comment": f"{order.get('comment', '')} | {reason}"
+        }}
+    )
+    
+    await db.funds.update_one(
+        {"username": order["username"]},
+        {"$inc": {"balance": net_pnl}}
+    )
+    
+    # Record result for risk management
+    record_trade_result(order["username"], net_pnl)
+    
+    emoji = "💰" if net_pnl >= 0 else "🔻"
+    print(f"[AutoTrade] {emoji} Closed {order['order_type']} on {symbol} (Ticket: {order['ticket']}) | Reason: {reason} | Net PNL: ${net_pnl:.2f}")
+
+
+async def manage_open_positions():
+    """
+    GUARDEER PRO v2.0 — Smart Position Management.
+    
+    Checks all open orders with multiple exit strategies:
+    1. Standard TP/SL hit
+    2. Dynamic trailing stop (3 stages)
+    3. Smart early exit (RSI/MACD reversal detection)
+    4. Time-based exit (stale trade cleanup)
+    5. Opposite signal exit
+    """
+    open_orders = await db.orders.find({"status": "open"}).to_list(1000)
+    
+    for order in open_orders:
+        symbol = order["symbol"]
+        tick = mt5.symbol_info_tick(symbol)
+        if not tick:
+            continue
+            
+        # Current price to close the order
+        current_price = tick.bid if order["order_type"] == "BUY" else tick.ask
+        tp = order.get("tp")
+        sl = order.get("sl")
+        open_price = order["open_price"]
+        atr_at_entry = order.get("atr_at_entry", 0)
+        trail_stage = order.get("trail_stage", 0)
+        
+        # ── INCREMENT CANDLE COUNT ──
+        candle_count = order.get("open_candle_count", 0) + 1
+        await db.orders.update_one(
+            {"_id": order["_id"]},
+            {"$set": {"open_candle_count": candle_count}}
+        )
+        
+        # ════════════════════════════════════════════════════════════
+        # EXIT CHECK 1: Standard TP/SL
+        # ════════════════════════════════════════════════════════════
+        
+        close_it = False
+        close_reason = "TP/SL Hit"
+        
+        if order["order_type"] == "BUY":
+            if sl and current_price <= sl:
+                close_it = True
+                close_reason = "SL Hit"
+            if tp and current_price >= tp:
+                close_it = True
+                close_reason = "TP Hit 🎯"
+        else:
+            if sl and current_price >= sl:
+                close_it = True
+                close_reason = "SL Hit"
+            if tp and current_price <= tp:
+                close_it = True
+                close_reason = "TP Hit 🎯"
+        
+        if close_it:
+            await close_position(order, current_price, close_reason)
+            continue
+        
+        # ════════════════════════════════════════════════════════════
+        # EXIT CHECK 2: Time-Based Exit (stale trades)
+        # ════════════════════════════════════════════════════════════
+        
+        if candle_count >= MAX_TRADE_AGE_CANDLES:
+            pnl = calc_pnl(order["order_type"], open_price, current_price, order["lot_size"], symbol)
+            # Fix: Only time-exit if trade is losing or flat. If it's in a strong winning trend (stage 2+), let trailing stop handle it!
+            if trail_stage < 2:
+                await close_position(order, current_price, f"Time Exit ({candle_count} candles, PnL: ${pnl:.2f})")
+                continue
+        
+        # If in profit but flat for too long
+        if candle_count >= FLAT_TRADE_CANDLES:
+            pnl = calc_pnl(order["order_type"], open_price, current_price, order["lot_size"], symbol)
+            if pnl > 0:
+                # Check if price hasn't moved much in recent candles
+                df = get_market_data(symbol, mt5.TIMEFRAME_M5, FLAT_TRADE_CANDLES + 5)
+                if df is not None and len(df) >= FLAT_TRADE_CANDLES:
+                    recent_range = df['high'].iloc[-FLAT_TRADE_CANDLES:].max() - df['low'].iloc[-FLAT_TRADE_CANDLES:].min()
+                    if atr_at_entry and recent_range < atr_at_entry * 0.5:
+                        await close_position(order, current_price, f"Flat Exit (profit secured: ${pnl:.2f})")
+                        continue
+        
+        # ════════════════════════════════════════════════════════════
+        # EXIT CHECK 3: Smart Early Exit (Chart Analysis)
+        # ════════════════════════════════════════════════════════════
+        
+        df = get_market_data(symbol, mt5.TIMEFRAME_M5, 300)
+        if df is not None and len(df) > 0:
+            df_ind = calculate_indicators(df, symbol=symbol)
+            if df_ind is not None and len(df_ind) > 0:
+                # ── 3A: Opposite signal detected ──
+                latest = df_ind.iloc[-1]
+                sig = latest['signal']
+                if pd.notna(sig):
+                    if order["order_type"] == "BUY" and sig == "SELL":
+                        await close_position(order, current_price, "Trend Reversal (SELL signal)")
+                        continue
+                    elif order["order_type"] == "SELL" and sig == "BUY":
+                        await close_position(order, current_price, "Trend Reversal (BUY signal)")
+                        continue
+                
+                # ── 3B: RSI/MACD/Pattern-based early exit ──
+                exit_analysis = analyze_exit_conditions(df_ind)
+                
+                if order["order_type"] == "BUY" and exit_analysis["should_exit_buy"]:
+                    pnl = calc_pnl(order["order_type"], open_price, current_price, order["lot_size"], symbol)
+                    # Only early-exit if we're in a loss or minimal profit
+                    # (don't exit a winning trade just because RSI is high — trailing stop handles that)
+                    if pnl <= 0:
+                        await close_position(order, current_price, f"Smart Exit BUY: {exit_analysis['reason']}")
+                        continue
+                
+                elif order["order_type"] == "SELL" and exit_analysis["should_exit_sell"]:
+                    pnl = calc_pnl(order["order_type"], open_price, current_price, order["lot_size"], symbol)
+                    if pnl <= 0:
+                        await close_position(order, current_price, f"Smart Exit SELL: {exit_analysis['reason']}")
+                        continue
+        
+        # ════════════════════════════════════════════════════════════
+        # MODIFY: Dynamic Trailing Stop (3-Stage + Continuous)
+        # ════════════════════════════════════════════════════════════
+        
+        if atr_at_entry and atr_at_entry > 0 and sl:
+            new_sl = sl
+            new_stage = trail_stage
+            
+            if order["order_type"] == "BUY":
+                profit_distance = current_price - open_price
+                
+                # Stage 1: Breakeven
+                if profit_distance >= atr_at_entry * TRAIL_STAGE_1_TRIGGER and trail_stage < 1:
+                    new_sl = open_price + (tick.ask - tick.bid)  # Breakeven + spread
+                    new_stage = 1
+                    print(f"[AutoTrade] 🛡️ Stage 1: SL → Breakeven ({new_sl:.2f}) for {symbol} BUY (Ticket: {order['ticket']})")
+                
+                # Stage 2: +0.5 ATR profit locked
+                elif profit_distance >= atr_at_entry * TRAIL_STAGE_2_TRIGGER and trail_stage < 2:
+                    new_sl = open_price + (atr_at_entry * 0.5)
+                    new_stage = 2
+                    print(f"[AutoTrade] 📈 Stage 2: SL → +0.5 ATR ({new_sl:.2f}) for {symbol} BUY (Ticket: {order['ticket']})")
+                
+                # Stage 3: +1.0 ATR profit locked
+                elif profit_distance >= atr_at_entry * TRAIL_STAGE_3_TRIGGER and trail_stage < 3:
+                    new_sl = open_price + (atr_at_entry * 1.0)
+                    new_stage = 3
+                    print(f"[AutoTrade] 🚀 Stage 3: SL → +1.0 ATR ({new_sl:.2f}) for {symbol} BUY (Ticket: {order['ticket']})")
+                
+                # Continuous trailing: keep SL 1.0 ATR behind current price
+                elif trail_stage >= 3:
+                    trailing_sl = current_price - (atr_at_entry * TRAIL_CONTINUOUS_OFFSET)
+                    if trailing_sl > sl:  # Only move SL up, never down
+                        new_sl = trailing_sl
+                        new_stage = 4
+                
+            else:  # SELL
+                profit_distance = open_price - current_price
+                
+                # Stage 1: Breakeven
+                if profit_distance >= atr_at_entry * TRAIL_STAGE_1_TRIGGER and trail_stage < 1:
+                    new_sl = open_price - (tick.ask - tick.bid)  # Breakeven - spread
+                    new_stage = 1
+                    print(f"[AutoTrade] 🛡️ Stage 1: SL → Breakeven ({new_sl:.2f}) for {symbol} SELL (Ticket: {order['ticket']})")
+                
+                # Stage 2: +0.5 ATR profit locked
+                elif profit_distance >= atr_at_entry * TRAIL_STAGE_2_TRIGGER and trail_stage < 2:
+                    new_sl = open_price - (atr_at_entry * 0.5)
+                    new_stage = 2
+                    print(f"[AutoTrade] 📈 Stage 2: SL → -0.5 ATR ({new_sl:.2f}) for {symbol} SELL (Ticket: {order['ticket']})")
+                
+                # Stage 3: +1.0 ATR profit locked
+                elif profit_distance >= atr_at_entry * TRAIL_STAGE_3_TRIGGER and trail_stage < 3:
+                    new_sl = open_price - (atr_at_entry * 1.0)
+                    new_stage = 3
+                    print(f"[AutoTrade] 🚀 Stage 3: SL → -1.0 ATR ({new_sl:.2f}) for {symbol} SELL (Ticket: {order['ticket']})")
+                
+                # Continuous trailing
+                elif trail_stage >= 3:
+                    trailing_sl = current_price + (atr_at_entry * TRAIL_CONTINUOUS_OFFSET)
+                    if trailing_sl < sl:  # Only move SL down, never up
+                        new_sl = trailing_sl
+                        new_stage = 4
+            
+            # Apply trailing stop update
+            if new_sl != sl or new_stage != trail_stage:
+                await db.orders.update_one(
+                    {"_id": order["_id"]},
+                    {"$set": {"sl": new_sl, "trail_stage": new_stage}}
+                )
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  MAIN BOT LOOP
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+async def auto_trade_loop():
+    """Main infinite loop for the background auto trading bot."""
+    print("=" * 60)
+    print("[AutoTrade] GUARDEER PRO v2.0 Bot Started")
+    print("[AutoTrade] Features: Multi-confirmation signals, Dynamic trailing,")
+    print("[AutoTrade]           Smart exits, Risk management, HTF filter")
+    print("=" * 60)
+    
+    while True:
+        try:
+            # 1. Manage existing positions (TP/SL, trailing, smart exits)
+            await manage_open_positions()
+            
+            # 2. Scan for new high-quality signals
+            await scan_for_signals()
+            
+        except Exception as e:
+            print(f"[AutoTrade] Error in loop: {e}")
+            import traceback
+            traceback.print_exc()
+            
+        # Delay before next scan to prevent CPU exhaustion and respect MT5 rate limits
+        await asyncio.sleep(5)

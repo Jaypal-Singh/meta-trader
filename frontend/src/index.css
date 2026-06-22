@@ -1,0 +1,26 @@
+@import "tailwindcss";
+
+@theme {
+  --color-trading-bg: #0F172A;
+  --color-trading-panel: #1E293B;
+  --color-trading-buy: #10B981;
+  --color-trading-sell: #EF4444;
+  --color-trading-text: #F8FAFC;
+  --color-trading-muted: #94A3B8;
+}
+
+@layer base {
+  body {
+    @apply bg-trading-bg text-trading-text;
+  }
+}
+
+/* Hide scrollbar for horizontal scroll chips */
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+

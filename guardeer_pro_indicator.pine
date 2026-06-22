@@ -1,0 +1,304 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © GUARDEER PRO
+
+//@version=5
+indicator("GUARDEER PRO v2.0 - Institutional Engine", overlay=true, 
+     max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 1. INPUTS & CONFIGURATION
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+grpSwing = "Swing Detection Engine"
+swingLen     = input.int(5, "Swing Pivot Length", minval=2, group=grpSwing, tooltip="Higher value = fewer but stronger signals")
+historyBars  = input.int(2000, "History Lookback (bars)", minval=100, maxval=5000, group=grpSwing)
+
+grpVP = "Volume Profile (Smart Zones)"
+showVP       = input.bool(true, "Show Volume Profile", group=grpVP)
+vpRows       = input.int(12, "Rows per Swing", minval=5, maxval=40, group=grpVP)
+vpWidth      = input.int(15, "Max Bar Width (bars)", minval=5, group=grpVP)
+upColor      = input.color(color.new(#00E676, 60), "Up Volume Color", group=grpVP)
+dnColor      = input.color(color.new(#FF1744, 60), "Down Volume Color", group=grpVP)
+pocColor     = input.color(color.new(color.yellow, 20), "POC Highlight", group=grpVP)
+showPOC      = input.bool(true, "Highlight POC", group=grpVP)
+vpRecentOnly = input.int(20, "VP Only Last N Swings", minval=5, maxval=100, group=grpVP, tooltip="Limits memory usage by only drawing recent volume profiles")
+
+grpOB = "HVN / Order Block Zones"
+showOB          = input.bool(true, "Show HVN Boxes", group=grpOB)
+extendBars      = input.int(30, "Extend Box Right", group=grpOB)
+tpATRmult       = input.float(2.0, "TP ATR Multiplier", step=0.1, group=grpOB)
+slATRmult       = input.float(1.0, "SL ATR Multiplier", step=0.1, group=grpOB)
+buyColor        = input.color(color.new(#00BCD4, 85), "Buy HVN Zone", group=grpOB)
+sellColor       = input.color(color.new(#E91E63, 85), "Sell HVN Zone", group=grpOB)
+showLabels      = input.bool(true, "Show TP/SL Labels", group=grpOB)
+labelRecentOnly = input.int(15, "Labels Only Last N Boxes", minval=3, maxval=50, group=grpOB)
+
+grpSig = "Signal Engine"
+showSignals = input.bool(true, "Show Buy/Sell Arrows", group=grpSig)
+buyArrow    = input.color(#00E676, "Buy Arrow", group=grpSig)
+sellArrow   = input.color(#FF1744, "Sell Arrow", group=grpSig)
+
+grpDash = "Premium Dashboard"
+showDash  = input.bool(true, "Show Dashboard", group=grpDash)
+dashLoc   = input.string("top_right", "Position", options=["top_right","top_left","bottom_right","bottom_left","middle_right"], group=grpDash)
+dashSize  = input.string("small", "Size", options=["tiny","small","normal","large"], group=grpDash)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 2. CORE HELPERS & VARIABLES
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+atrV = ta.atr(14)
+
+txtSize = dashSize == "tiny" ? size.tiny : dashSize == "small" ? size.small : dashSize == "large" ? size.large : size.normal
+dashPos = dashLoc == "top_left" ? position.top_left : dashLoc == "bottom_right" ? position.bottom_right : dashLoc == "bottom_left" ? position.bottom_left : dashLoc == "middle_right" ? position.middle_right : position.top_right
+
+var int totalSignals = 0
+var int buySignals   = 0
+var int sellSignals  = 0
+var int wins         = 0
+var int losses       = 0
+var int openTrades   = 0
+var int holograms    = 0
+var int totalSwings  = 0
+
+var float[] openBuyEntries  = array.new_float()
+var float[] openBuyTPs      = array.new_float()
+var float[] openBuySLs      = array.new_float()
+var float[] openSellEntries = array.new_float()
+var float[] openSellTPs     = array.new_float()
+var float[] openSellSLs     = array.new_float()
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 3. DRAWING FUNCTIONS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+drawHVNZone(int startBar, float hi, float lo, bool isBuy) =>
+    if showOB
+        col     = isBuy ? color.new(#00BCD4, 40) : color.new(#E91E63, 40)
+        fillCol = isBuy ? buyColor : sellColor
+        topL = line.new(startBar, hi, bar_index + extendBars, hi, color=col, width=2)
+        botL = line.new(startBar, lo, bar_index + extendBars, lo, color=col, width=2)
+        linefill.new(topL, botL, color=fillCol)
+
+drawSwingVP(int startBar, int endBar, float hi, float lo) =>
+    if showVP and endBar > startBar and hi > lo
+        bars = endBar - startBar
+        rowH = (hi - lo) / vpRows
+        
+        float[] upVols = array.new_float(vpRows, 0)
+        float[] dnVols = array.new_float(vpRows, 0)
+        
+        for i = 0 to bars - 1
+            barIdx = endBar - i
+            offset = bar_index - barIdx
+            if offset >= 0 and offset < 5000
+                bH = high[offset]
+                bL = low[offset]
+                bV = volume[offset]
+                bUp = close[offset] >= open[offset]
+                
+                for r = 0 to vpRows - 1
+                    rLo = lo + r * rowH
+                    rHi = rLo + rowH
+                    if bH >= rLo and bL <= rHi
+                        share = bV / vpRows
+                        if bUp
+                            array.set(upVols, r, array.get(upVols, r) + share)
+                        else
+                            array.set(dnVols, r, array.get(dnVols, r) + share)
+        
+        float maxVol = 0.0
+        int   pocRow = 0
+        for r = 0 to vpRows - 1
+            tot = array.get(upVols, r) + array.get(dnVols, r)
+            if tot > maxVol
+                maxVol := tot
+                pocRow := r
+        
+        if maxVol > 0
+            for r = 0 to vpRows - 1
+                up = array.get(upVols, r)
+                dn = array.get(dnVols, r)
+                tot = up + dn
+                if tot > 0
+                    wTotal = math.max(1, int((tot / maxVol) * vpWidth))
+                    wUp    = int((up / tot) * wTotal)
+                    wDn    = wTotal - wUp
+                    rLo = lo + r * rowH
+                    rHi = rLo + rowH
+                    isPOC = showPOC and r == pocRow
+                    
+                    if wUp > 0
+                        box.new(startBar, rHi, startBar + wUp, rLo, bgcolor = isPOC ? pocColor : upColor, border_color=color.new(color.gray, 95))
+                    if wDn > 0
+                        box.new(startBar + wUp, rHi, startBar + wUp + wDn, rLo, bgcolor = isPOC ? pocColor : dnColor, border_color=color.new(color.gray, 95))
+
+drawTPLabel(int barIdx, float hi, float lo, bool isBuy, float tp, float sl, int swingNum) =>
+    if showLabels and (totalSwings - swingNum) <= labelRecentOnly
+        txtCol  = isBuy ? color.new(#00BCD4, 0)  : color.new(#E91E63, 0)
+        txt = (isBuy ? "BUY HVN\nTP: " : "SELL HVN\nTP: ") + str.tostring(tp, format.mintick) + "\nSL: " + str.tostring(sl, format.mintick)
+        label.new(bar_index + extendBars, (hi + lo) / 2, txt, style=label.style_label_left, color=txtCol, textcolor=color.white, size=size.small)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 4. SIGNAL GENERATION LOGIC
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ph = ta.pivothigh(high, swingLen, swingLen)
+pl = ta.pivotlow(low, swingLen, swingLen)
+
+var int   lastPivotBar   = na
+var float lastPivotPrice = na
+var bool  lastWasHigh    = false
+
+inHistory = bar_index > (last_bar_index - historyBars)
+
+// SELL SWING (Pivot High)
+if not na(ph) and inHistory
+    pivotBar = bar_index - swingLen
+    pivotPrice = ph
+    if not na(lastPivotBar) and not lastWasHigh
+        hi = pivotPrice
+        lo = lastPivotPrice
+        totalSwings += 1
+        
+        drawSwingVP(lastPivotBar, pivotBar, hi, lo)
+        
+        if showOB
+            entry = close
+            tp = entry - atrV * tpATRmult
+            sl = entry + atrV * slATRmult
+            zoneHi = hi
+            zoneLo = hi - (hi - lo) * 0.15
+            drawHVNZone(pivotBar, zoneHi, zoneLo, false)
+            drawTPLabel(pivotBar, zoneHi, zoneLo, false, tp, sl, totalSwings)
+            
+            array.push(openSellEntries, entry)
+            array.push(openSellTPs, tp)
+            array.push(openSellSLs, sl)
+            sellSignals  += 1
+            totalSignals += 1
+            openTrades   += 1
+            holograms    += 1
+        
+        if showSignals
+            label.new(pivotBar, hi + atrV*0.5, "▼", style=label.style_none, textcolor=sellArrow, size=size.normal, yloc=yloc.price)
+    
+    lastPivotBar   := pivotBar
+    lastPivotPrice := pivotPrice
+    lastWasHigh    := true
+
+// BUY SWING (Pivot Low)
+if not na(pl) and inHistory
+    pivotBar = bar_index - swingLen
+    pivotPrice = pl
+    if not na(lastPivotBar) and lastWasHigh
+        hi = lastPivotPrice
+        lo = pivotPrice
+        totalSwings += 1
+        
+        drawSwingVP(lastPivotBar, pivotBar, hi, lo)
+        
+        if showOB
+            entry = close
+            tp = entry + atrV * tpATRmult
+            sl = entry - atrV * slATRmult
+            zoneHi = lo + (hi - lo) * 0.15
+            zoneLo = lo
+            drawHVNZone(pivotBar, zoneHi, zoneLo, true)
+            drawTPLabel(pivotBar, zoneHi, zoneLo, true, tp, sl, totalSwings)
+            
+            array.push(openBuyEntries, entry)
+            array.push(openBuyTPs, tp)
+            array.push(openBuySLs, sl)
+            buySignals   += 1
+            totalSignals += 1
+            openTrades   += 1
+            holograms    += 1
+        
+        if showSignals
+            label.new(pivotBar, lo - atrV*0.5, "▲", style=label.style_none, textcolor=buyArrow, size=size.normal, yloc=yloc.price)
+    
+    lastPivotBar   := pivotBar
+    lastPivotPrice := pivotPrice
+    lastWasHigh    := false
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 5. TRADE TRACKING & DASHBOARD
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+if array.size(openBuyEntries) > 0
+    for i = array.size(openBuyEntries) - 1 to 0
+        tp = array.get(openBuyTPs, i)
+        sl = array.get(openBuySLs, i)
+        if high >= tp
+            wins       += 1
+            openTrades -= 1
+            array.remove(openBuyEntries, i)
+            array.remove(openBuyTPs, i)
+            array.remove(openBuySLs, i)
+        else if low <= sl
+            losses     += 1
+            openTrades -= 1
+            array.remove(openBuyEntries, i)
+            array.remove(openBuyTPs, i)
+            array.remove(openBuySLs, i)
+
+if array.size(openSellEntries) > 0
+    for i = array.size(openSellEntries) - 1 to 0
+        tp = array.get(openSellTPs, i)
+        sl = array.get(openSellSLs, i)
+        if low <= tp
+            wins       += 1
+            openTrades -= 1
+            array.remove(openSellEntries, i)
+            array.remove(openSellTPs, i)
+            array.remove(openSellSLs, i)
+        else if high >= sl
+            losses     += 1
+            openTrades -= 1
+            array.remove(openSellEntries, i)
+            array.remove(openSellTPs, i)
+            array.remove(openSellSLs, i)
+
+if showDash and barstate.islast
+    closedTrades = wins + losses
+    winRate = closedTrades > 0 ? (wins / closedTrades) * 100 : 0
+    
+    var table dash = table.new(dashPos, 2, 9, border_width=2, border_color=color.new(#1A237E, 30))
+    
+    table.cell(dash, 0, 0, "🎯 GUARDEER PRO v2", bgcolor=color.new(#311B92, 0), text_color=color.white, text_size=txtSize)
+    table.cell(dash, 1, 0, "STATS",          bgcolor=color.new(#311B92, 0), text_color=color.white, text_size=txtSize)
+    
+    bgRow  = color.new(#121212, 10)
+    txtCol = color.new(color.white, 20)
+    
+    table.cell(dash, 0, 1, "Holograms",     bgcolor=bgRow, text_color=txtCol, text_size=txtSize)
+    table.cell(dash, 1, 1, str.tostring(holograms), bgcolor=bgRow, text_color=color.yellow, text_size=txtSize)
+    
+    table.cell(dash, 0, 2, "Total Signals", bgcolor=bgRow, text_color=txtCol, text_size=txtSize)
+    table.cell(dash, 1, 2, str.tostring(totalSignals), bgcolor=bgRow, text_color=color.aqua, text_size=txtSize)
+    
+    table.cell(dash, 0, 3, "Buy Signals",   bgcolor=bgRow, text_color=txtCol, text_size=txtSize)
+    table.cell(dash, 1, 3, str.tostring(buySignals), bgcolor=bgRow, text_color=#00E676, text_size=txtSize)
+    
+    table.cell(dash, 0, 4, "Sell Signals",  bgcolor=bgRow, text_color=txtCol, text_size=txtSize)
+    table.cell(dash, 1, 4, str.tostring(sellSignals), bgcolor=bgRow, text_color=#FF1744, text_size=txtSize)
+    
+    table.cell(dash, 0, 5, "Open Trades",   bgcolor=bgRow, text_color=txtCol, text_size=txtSize)
+    table.cell(dash, 1, 5, str.tostring(openTrades), bgcolor=bgRow, text_color=color.orange, text_size=txtSize)
+    
+    table.cell(dash, 0, 6, "Wins ✅", bgcolor=bgRow, text_color=txtCol, text_size=txtSize)
+    table.cell(dash, 1, 6, str.tostring(wins), bgcolor=bgRow, text_color=#00E676, text_size=txtSize)
+    
+    table.cell(dash, 0, 7, "Losses ❌", bgcolor=bgRow, text_color=txtCol, text_size=txtSize)
+    table.cell(dash, 1, 7, str.tostring(losses), bgcolor=bgRow, text_color=#FF1744, text_size=txtSize)
+    
+    wrColor = winRate >= 65 ? #00E676 : winRate >= 45 ? color.orange : #FF1744
+    table.cell(dash, 0, 8, "Win Rate 🏆", bgcolor=color.new(#1A237E, 0), text_color=color.white, text_size=txtSize)
+    table.cell(dash, 1, 8, str.tostring(winRate, "#.##") + "%", bgcolor=color.new(#1A237E, 0), text_color=wrColor, text_size=txtSize)
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 6. ALERTS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+alertcondition(not na(pl), "🟢 Buy Swing Signal", "GUARDEER PRO: Bullish HVN Swing Detected!")
+alertcondition(not na(ph), "🔴 Sell Swing Signal", "GUARDEER PRO: Bearish HVN Swing Detected!")
