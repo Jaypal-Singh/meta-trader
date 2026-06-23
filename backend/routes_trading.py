@@ -170,6 +170,10 @@ def get_chart_data(symbol: str, timeframe: str = "M5"):
     
     tf = tf_map.get(timeframe.upper(), mt5.TIMEFRAME_M5)
     
+    # Get symbol's actual decimal digits from MT5 (e.g., XAUUSD=3, EURUSD=5)
+    sym_info = mt5.symbol_info(symbol)
+    digits = sym_info.digits if sym_info and sym_info.digits else 2
+    
     df = get_market_data(symbol, tf, 2000)
     if df is None:
         raise HTTPException(status_code=404, detail="Symbol not found or no data available")
@@ -202,37 +206,37 @@ def get_chart_data(symbol: str, timeframe: str = "M5"):
         
         item = {
             "time": time_val,
-            "open": float(row['open']),
-            "high": float(row['high']),
-            "low": float(row['low']),
-            "close": float(row['close']),
+            "open": round(float(row['open']), digits),
+            "high": round(float(row['high']), digits),
+            "low": round(float(row['low']), digits),
+            "close": round(float(row['close']), digits),
             "signal": sig
         }
         
         # Add SL/TP only if there is a signal
         if sig in ('BUY', 'SELL'):
-            tp_val = float(row['tp']) if pd.notna(row['tp']) else None
-            sl_val = float(row['sl']) if pd.notna(row['sl']) else None
+            tp_val = round(float(row['tp']), digits) if pd.notna(row['tp']) else None
+            sl_val = round(float(row['sl']), digits) if pd.notna(row['sl']) else None
             item['tp'] = tp_val
             item['sl'] = sl_val
             
         data.append(item)
         
-        # Indicator overlay data for the chart
+        # Indicator overlay data — use symbol's actual digits, not hardcoded 2
         if 'ema_21' in row and pd.notna(row['ema_21']):
-            ema21_data.append({"time": time_val, "value": round(float(row['ema_21']), 2)})
+            ema21_data.append({"time": time_val, "value": round(float(row['ema_21']), digits)})
         if 'ema_50' in row and pd.notna(row['ema_50']):
-            ema50_data.append({"time": time_val, "value": round(float(row['ema_50']), 2)})
+            ema50_data.append({"time": time_val, "value": round(float(row['ema_50']), digits)})
         if 'ema_200' in row and pd.notna(row['ema_200']):
-            ema200_data.append({"time": time_val, "value": round(float(row['ema_200']), 2)})
+            ema200_data.append({"time": time_val, "value": round(float(row['ema_200']), digits)})
         if 'rsi' in row and pd.notna(row['rsi']):
             rsi_data.append({"time": time_val, "value": round(float(row['rsi']), 2)})
         if 'macd_line' in row and pd.notna(row['macd_line']):
-            macd_data.append({"time": time_val, "value": round(float(row['macd_line']), 4)})
+            macd_data.append({"time": time_val, "value": round(float(row['macd_line']), digits)})
         if 'macd_signal' in row and pd.notna(row['macd_signal']):
-            macd_signal_data.append({"time": time_val, "value": round(float(row['macd_signal']), 4)})
+            macd_signal_data.append({"time": time_val, "value": round(float(row['macd_signal']), digits)})
         if 'macd_hist' in row and pd.notna(row['macd_hist']):
-            macd_hist_data.append({"time": time_val, "value": round(float(row['macd_hist']), 4)})
+            macd_hist_data.append({"time": time_val, "value": round(float(row['macd_hist']), digits)})
         
     accuracy = calculate_accuracy(df_with_signals)
     

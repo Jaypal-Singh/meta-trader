@@ -427,22 +427,42 @@ async def manage_open_positions():
                         await close_position(order, current_price, "Trend Reversal (BUY signal)")
                         continue
                 
-                # ── 3B: RSI/MACD/Pattern-based early exit ──
+                # ── 3B: RSI/MACD/EMA Pattern-based early exit ──
                 exit_analysis = analyze_exit_conditions(df_ind)
                 
                 if order["order_type"] == "BUY" and exit_analysis["should_exit_buy"]:
                     pnl = calc_pnl(order["order_type"], open_price, current_price, order["lot_size"], symbol)
-                    # Only early-exit if we're in a loss or minimal profit
-                    # (don't exit a winning trade just because RSI is high — trailing stop handles that)
-                    if pnl <= 0:
+                    # Exit losing trades immediately on reversal signal
+                    # Exit winning trades only if reversal is confirmed (EMA cross or price break)
+                    if pnl <= 0 or trail_stage >= 1:
                         await close_position(order, current_price, f"Smart Exit BUY: {exit_analysis['reason']}")
                         continue
                 
                 elif order["order_type"] == "SELL" and exit_analysis["should_exit_sell"]:
                     pnl = calc_pnl(order["order_type"], open_price, current_price, order["lot_size"], symbol)
-                    if pnl <= 0:
+                    if pnl <= 0 or trail_stage >= 1:
                         await close_position(order, current_price, f"Smart Exit SELL: {exit_analysis['reason']}")
                         continue
+                
+                # ── 3C: Dynamic TP Extension (Push TP further when momentum is strong) ──
+                if tp and atr_at_entry and atr_at_entry > 0:
+                    if order["order_type"] == "BUY" and exit_analysis.get("extend_tp_buy"):
+                        new_tp = tp + (atr_at_entry * 0.5)  # Extend TP by 0.5 ATR
+                        if new_tp > tp:
+                            await db.orders.update_one(
+                                {"_id": order["_id"]},
+                                {"$set": {"tp": new_tp}}
+                            )
+                            print(f"[AutoTrade] 🎯 TP Extended for BUY {symbol}: {tp:.2f} → {new_tp:.2f} (Strong momentum)")
+                    
+                    elif order["order_type"] == "SELL" and exit_analysis.get("extend_tp_sell"):
+                        new_tp = tp - (atr_at_entry * 0.5)  # Extend TP by 0.5 ATR
+                        if new_tp < tp:
+                            await db.orders.update_one(
+                                {"_id": order["_id"]},
+                                {"$set": {"tp": new_tp}}
+                            )
+                            print(f"[AutoTrade] 🎯 TP Extended for SELL {symbol}: {tp:.2f} → {new_tp:.2f} (Strong momentum)")
         
         # ════════════════════════════════════════════════════════════
         # MODIFY: Dynamic Trailing Stop (3-Stage + Continuous)

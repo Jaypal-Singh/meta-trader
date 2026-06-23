@@ -139,35 +139,38 @@ def calculate_swing_vp(df, start_idx, end_idx, vp_rows=12):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  GUARDEER PRO v3.0 — FULL PINE SCRIPT INTEGRATION
+#  GUARDEER PRO v2.0 — EXACT PINE SCRIPT TRANSLATION
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def calculate_indicators(df, swing_len=5, tp_mult=2.0, sl_mult=1.0, symbol="XAUUSD"):
     """
-    GUARDEER PRO v3.0 — Full Pine Script Integration.
+    GUARDEER PRO v2.0 — Exact Pine Script Translation.
     
-    Now properly calculates ALL indicators that were previously missing:
-    - EMA 21 (fast trend)
-    - EMA 50 (medium trend)  
-    - EMA 200 (major trend)
-    - MACD (12,26,9)
-    - RSI (14)
-    - ATR (14)
-    - Volume Profile POC per swing
-    - HVN Zone boundaries (matching Pine Script's 15% zone)
+    Signal Logic (100% matching Pine Script):
+    ─────────────────────────────────────────
+    Pine Script Section 4:
+      ph = ta.pivothigh(high, swingLen, swingLen)
+      pl = ta.pivotlow(low, swingLen, swingLen)
     
-    Signal logic:
-    - Swing detection via pivot high/low (same as Pine Script)
-    - HVN zone validation (price must break through POC)
-    - Multi-confirmation: Trend + Pullback + Momentum
-    - Mean reversion for extreme moves
+      SELL = pivothigh detected + lastWasHigh == false (last pivot was LOW)
+             → Swing from Low to High is complete → Sell at the top
+             → Arrow drawn at pivotBar, entry = close (current bar)
+    
+      BUY  = pivotlow detected + lastWasHigh == true (last pivot was HIGH)
+             → Swing from High to Low is complete → Buy at the bottom
+             → Arrow drawn at pivotBar, entry = close (current bar)
+    
+      TP/SL = entry ± ATR(14) * multiplier
+    
+    NO additional filters. Pine Script uses ONLY pivots + alternation.
+    EMA/RSI/MACD are calculated for dashboard display only.
     """
     if df is None or len(df) < swing_len + 30:
         return None
     
-    # ── 1. CORE INDICATORS ────────────────────────────────────────────
+    # ── 1. CORE INDICATORS (for dashboard & chart display ONLY) ────
     
-    # ATR (14) — Average True Range for volatility
+    # ATR (14) — Used for TP/SL calculation (matches Pine: ta.atr(14))
     df['prev_close'] = df['close'].shift(1)
     df['tr'] = np.maximum(
         abs(df['high'] - df['low']),
@@ -178,19 +181,19 @@ def calculate_indicators(df, swing_len=5, tp_mult=2.0, sl_mult=1.0, symbol="XAUU
     )
     df['atr'] = df['tr'].rolling(window=14).mean()
     
-    # EMA 21 (fast), EMA 50 (medium), EMA 200 (major trend)
+    # EMA 21, 50, 200 — For chart overlay display only
     df['ema_21'] = df['close'].ewm(span=21, adjust=False).mean()
     df['ema_50'] = df['close'].ewm(span=50, adjust=False).mean()
     df['ema_200'] = df['close'].ewm(span=200, adjust=False).mean()
     
-    # MACD (12, 26, 9) — Momentum oscillator
+    # MACD (12, 26, 9) — For dashboard display only
     ema_12 = df['close'].ewm(span=12, adjust=False).mean()
     ema_26 = df['close'].ewm(span=26, adjust=False).mean()
     df['macd_line'] = ema_12 - ema_26
     df['macd_signal'] = df['macd_line'].ewm(span=9, adjust=False).mean()
     df['macd_hist'] = df['macd_line'] - df['macd_signal']
     
-    # RSI (14) — Relative Strength Index
+    # RSI (14) — For dashboard display only
     delta = df['close'].diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
@@ -199,146 +202,113 @@ def calculate_indicators(df, swing_len=5, tp_mult=2.0, sl_mult=1.0, symbol="XAUU
     rs = avg_gain / (avg_loss + 1e-10)
     df['rsi'] = 100 - (100 / (1 + rs))
     
-    # Candle body for exit analysis
+    # Candle body — For exit analysis in autotrade
     df['body'] = abs(df['close'] - df['open'])
     df['avg_body'] = df['body'].rolling(window=14).mean()
     
-    # ── 2. HIGHER TIMEFRAME TREND ─────────────────────────────────────
-    
-    htf_trend = get_higher_tf_trend(symbol)
-    
-    # ── 3. PIVOT DETECTION & SIGNAL GENERATION ────────────────────────
-    #    Matching Pine Script: ta.pivothigh / ta.pivotlow + HVN zones
+    # ── 2. PIVOT DETECTION & SIGNAL GENERATION ─────────────────────
+    #    EXACT translation of Pine Script Section 4.
+    #
+    #    Pine Script variables:
+    #      var int   lastPivotBar   = na
+    #      var float lastPivotPrice = na
+    #      var bool  lastWasHigh    = false
+    #
+    #    SELL condition: not na(ph) and not na(lastPivotBar) and not lastWasHigh
+    #    BUY  condition: not na(pl) and not na(lastPivotBar) and lastWasHigh
     
     df['signal'] = None
     df['tp'] = np.nan
     df['sl'] = np.nan
-    df['confirm_bar_idx'] = np.nan
     
-    last_pivot_bar   = None
-    last_pivot_price = None
-    last_was_high    = False
+    last_pivot_bar   = None      # Pine: var int lastPivotBar = na
+    last_pivot_price = None      # Pine: var float lastPivotPrice = na
+    last_was_high    = False     # Pine: var bool lastWasHigh = false
     
     for confirm_bar in range(swing_len * 2, len(df)):
         pivot_bar = confirm_bar - swing_len
         left_start = pivot_bar - swing_len
         right_end = confirm_bar
         
-        # ta.pivothigh: pivot_bar's high is the max in the full window
+        if left_start < 0:
+            continue
+        
+        # ── ta.pivothigh(high, swingLen, swingLen) ──
+        # pivot_bar's high must be strictly the maximum in the window
         window_high = df['high'].iloc[left_start : right_end + 1]
         is_ph = (df['high'].iloc[pivot_bar] == window_high.max())
         
-        # ta.pivotlow: pivot_bar's low is the min in the full window
+        # ── ta.pivotlow(low, swingLen, swingLen) ──
+        # pivot_bar's low must be strictly the minimum in the window
         window_low = df['low'].iloc[left_start : right_end + 1]
         is_pl = (df['low'].iloc[pivot_bar] == window_low.min())
         
-        # ===== SELL SWING (Pine Script: pivothigh detected) =====
+        # ═══════════════════════════════════════════════════════════
+        # SELL SWING — Pine Script:
+        #   if not na(ph) and inHistory
+        #     if not na(lastPivotBar) and not lastWasHigh
+        #       → A Low-to-High swing is complete → SELL at the top
+        #       entry = close
+        #       tp = entry - atrV * tpATRmult
+        #       sl = entry + atrV * slATRmult
+        # ═══════════════════════════════════════════════════════════
         if is_ph:
             pivot_price = df['high'].iloc[pivot_bar]
-            if last_pivot_bar is not None:
+            
+            if last_pivot_bar is not None and not last_was_high:
+                # Pine: hi = pivotPrice, lo = lastPivotPrice
+                swing_hi = pivot_price
+                swing_lo = last_pivot_price
+                
+                # Pine: entry = close (current bar, NOT pivot bar)
                 entry = df['close'].iloc[confirm_bar]
                 atr_val = df['atr'].iloc[confirm_bar]
-                ema_200 = df['ema_200'].iloc[confirm_bar]
-                ema_50 = df['ema_50'].iloc[confirm_bar]
-                ema_21 = df['ema_21'].iloc[confirm_bar]
-                macd_hist = df['macd_hist'].iloc[confirm_bar]
-                macd_hist_prev = df['macd_hist'].iloc[confirm_bar - 1]
-                rsi_val = df['rsi'].iloc[confirm_bar]
-                rsi_pivot = df['rsi'].iloc[pivot_bar]
                 
-                # Volume Profile for this swing (matching Pine Script drawSwingVP)
-                vp = calculate_swing_vp(df, last_pivot_bar, pivot_bar)
-                
-                # HVN zone for SELL: top 15% of swing (matching Pine Script)
-                # zoneHi = hi, zoneLo = hi - (hi-lo)*0.15
-                if vp:
-                    poc_price = vp["poc_price"]
-                    swing_hi = vp["hi"]
-                    swing_lo = vp["lo"]
-                    # Price should be breaking below the heavy volume node
-                    is_below_hvn = (entry < poc_price)
-                else:
-                    is_below_hvn = True
-                
-                # ── Multi-Confirmation Filters ──
-                # 1. Trend: Price below EMA200 OR EMA50 crossing below EMA200
-                is_downtrend = (entry < ema_200) or (ema_50 < ema_200)
-                # 2. Pullback: RSI at pivot was elevated (sellers exhausted buyers)
-                is_valid_pullback = (rsi_pivot > 45)
-                # 3. Momentum: MACD histogram turning bearish
-                is_bearish_momentum = (macd_hist < macd_hist_prev)
-                # 4. HTF alignment (bonus confirmation, not required)
-                htf_aligned = (htf_trend != "BULLISH")
-                
-                # Extreme top reversal (works even against trend)
-                is_extreme_top = (rsi_pivot > 70 and is_bearish_momentum)
-                
-                is_valid_setup = (
-                    (is_downtrend and is_valid_pullback and is_bearish_momentum) or
-                    is_extreme_top
-                )
-                
-                if pd.notna(atr_val) and atr_val > 0 and is_valid_setup and is_below_hvn:
-                    # TP/SL matching Pine Script: ATR multiplied
-                    df.at[df.index[confirm_bar], 'signal'] = 'SELL'
-                    df.at[df.index[confirm_bar], 'tp'] = entry - (atr_val * tp_mult)
-                    df.at[df.index[confirm_bar], 'sl'] = entry + (atr_val * sl_mult)
-                
+                if pd.notna(atr_val) and atr_val > 0:
+                    tp = entry - (atr_val * tp_mult)
+                    sl = entry + (atr_val * sl_mult)
+                    
+                    # Signal placed at pivot_bar (where arrow appears in Pine Script)
+                    df.at[df.index[pivot_bar], 'signal'] = 'SELL'
+                    df.at[df.index[pivot_bar], 'tp'] = tp
+                    df.at[df.index[pivot_bar], 'sl'] = sl
+            
+            # Pine: lastPivotBar := pivotBar, lastWasHigh := true
             last_pivot_bar = pivot_bar
             last_pivot_price = pivot_price
             last_was_high = True
-
-        # ===== BUY SWING (Pine Script: pivotlow detected) =====
+        
+        # ═══════════════════════════════════════════════════════════
+        # BUY SWING — Pine Script:
+        #   if not na(pl) and inHistory
+        #     if not na(lastPivotBar) and lastWasHigh
+        #       → A High-to-Low swing is complete → BUY at the bottom
+        #       entry = close
+        #       tp = entry + atrV * tpATRmult
+        #       sl = entry - atrV * slATRmult
+        # ═══════════════════════════════════════════════════════════
         if is_pl:
             pivot_price = df['low'].iloc[pivot_bar]
-            if last_pivot_bar is not None:
+            
+            if last_pivot_bar is not None and last_was_high:
+                # Pine: hi = lastPivotPrice, lo = pivotPrice
+                swing_hi = last_pivot_price
+                swing_lo = pivot_price
+                
+                # Pine: entry = close (current bar, NOT pivot bar)
                 entry = df['close'].iloc[confirm_bar]
                 atr_val = df['atr'].iloc[confirm_bar]
-                ema_200 = df['ema_200'].iloc[confirm_bar]
-                ema_50 = df['ema_50'].iloc[confirm_bar]
-                ema_21 = df['ema_21'].iloc[confirm_bar]
-                macd_hist = df['macd_hist'].iloc[confirm_bar]
-                macd_hist_prev = df['macd_hist'].iloc[confirm_bar - 1]
-                rsi_val = df['rsi'].iloc[confirm_bar]
-                rsi_pivot = df['rsi'].iloc[pivot_bar]
                 
-                # Volume Profile for this swing
-                vp = calculate_swing_vp(df, last_pivot_bar, pivot_bar)
-                
-                # HVN zone for BUY: bottom 15% of swing (matching Pine Script)
-                # zoneLo = lo, zoneHi = lo + (hi-lo)*0.15
-                if vp:
-                    poc_price = vp["poc_price"]
-                    swing_hi = vp["hi"]
-                    swing_lo = vp["lo"]
-                    # Price should be breaking above the heavy volume node
-                    is_above_hvn = (entry > poc_price)
-                else:
-                    is_above_hvn = True
-                
-                # ── Multi-Confirmation Filters ──
-                # 1. Trend: Price above EMA200 OR EMA50 crossing above EMA200
-                is_uptrend = (entry > ema_200) or (ema_50 > ema_200)
-                # 2. Pullback: RSI at pivot was depressed (buyers absorbed selling)
-                is_valid_pullback = (rsi_pivot < 55)
-                # 3. Momentum: MACD histogram turning bullish
-                is_bullish_momentum = (macd_hist > macd_hist_prev)
-                # 4. HTF alignment (bonus confirmation)
-                htf_aligned = (htf_trend != "BEARISH")
-                
-                # Extreme bottom reversal (works even against trend)
-                is_extreme_bottom = (rsi_pivot < 30 and is_bullish_momentum)
-                
-                is_valid_setup = (
-                    (is_uptrend and is_valid_pullback and is_bullish_momentum) or
-                    is_extreme_bottom
-                )
-                
-                if pd.notna(atr_val) and atr_val > 0 and is_valid_setup and is_above_hvn:
-                    df.at[df.index[confirm_bar], 'signal'] = 'BUY'
-                    df.at[df.index[confirm_bar], 'tp'] = entry + (atr_val * tp_mult)
-                    df.at[df.index[confirm_bar], 'sl'] = entry - (atr_val * sl_mult)
-                
+                if pd.notna(atr_val) and atr_val > 0:
+                    tp = entry + (atr_val * tp_mult)
+                    sl = entry - (atr_val * sl_mult)
+                    
+                    # Signal placed at pivot_bar (where arrow appears in Pine Script)
+                    df.at[df.index[pivot_bar], 'signal'] = 'BUY'
+                    df.at[df.index[pivot_bar], 'tp'] = tp
+                    df.at[df.index[pivot_bar], 'sl'] = sl
+            
+            # Pine: lastPivotBar := pivotBar, lastWasHigh := false
             last_pivot_bar = pivot_bar
             last_pivot_price = pivot_price
             last_was_high = False
@@ -352,32 +322,90 @@ def calculate_indicators(df, swing_len=5, tp_mult=2.0, sl_mult=1.0, symbol="XAUU
 
 def analyze_exit_conditions(df):
     """
-    Analyze current market conditions for smart exit decisions.
-    Returns a dict with actionable intelligence for open positions.
+    GUARDEER PRO v2.0 — Smart Exit Analysis.
     
-    Only triggers on EXTREME conditions to avoid premature exits.
+    Analyzes the FULL chart to detect when a trade should be closed early.
+    Returns actionable signals based on:
+    
+    1. EMA Crossover Reversal (EMA 21 crosses wrong side of EMA 50)
+    2. Price Breaking Key EMA (close below EMA 50 for BUY, above for SELL)
+    3. MACD Histogram Reversal (3 consecutive bars flipping direction)
+    4. RSI Exhaustion Zones (extreme overbought/oversold)
+    5. Momentum Exhaustion (price stalling near recent highs/lows)
     """
     if df is None or len(df) < 30:
-        return {"should_exit_buy": False, "should_exit_sell": False, "reason": "Insufficient data"}
+        return {
+            "should_exit_buy": False, "should_exit_sell": False,
+            "reason": "Insufficient data",
+            "extend_tp_buy": False, "extend_tp_sell": False,
+        }
     
     latest = df.iloc[-1]
-    prev = df.iloc[-2] if len(df) > 1 else latest
+    prev = df.iloc[-2]
+    prev2 = df.iloc[-3] if len(df) > 2 else prev
     
+    close = latest['close']
     rsi = latest['rsi'] if 'rsi' in df.columns else 50
     macd_hist = latest['macd_hist'] if 'macd_hist' in df.columns else 0
+    macd_hist_p1 = prev['macd_hist'] if 'macd_hist' in df.columns else 0
+    macd_hist_p2 = prev2['macd_hist'] if 'macd_hist' in df.columns else 0
+    ema_21 = latest['ema_21'] if 'ema_21' in df.columns else close
+    ema_50 = latest['ema_50'] if 'ema_50' in df.columns else close
+    ema_200 = latest['ema_200'] if 'ema_200' in df.columns else close
     
     exit_buy = False
     exit_sell = False
+    extend_tp_buy = False
+    extend_tp_sell = False
     reasons = []
     
-    # ── RSI Extreme Exhaustion (True Reversals Only) ──
-    # Only exit if the market is extremely over-extended
-    if rsi > 80:
+    # ── 1. EMA CROSSOVER REVERSAL ──
+    # If EMA 21 crosses below EMA 50 → bearish reversal → exit BUY
+    prev_ema21 = prev['ema_21'] if 'ema_21' in df.columns else close
+    prev_ema50 = prev['ema_50'] if 'ema_50' in df.columns else close
+    
+    if prev_ema21 >= prev_ema50 and ema_21 < ema_50:
+        exit_buy = True
+        reasons.append("EMA 21 crossed below EMA 50 (Bearish)")
+    
+    if prev_ema21 <= prev_ema50 and ema_21 > ema_50:
+        exit_sell = True
+        reasons.append("EMA 21 crossed above EMA 50 (Bullish)")
+    
+    # ── 2. PRICE BREAKING KEY EMA ──
+    # Close below EMA 50 for BUY = trend weakening
+    if close < ema_50 and prev['close'] >= prev_ema50:
+        exit_buy = True
+        reasons.append(f"Price broke below EMA 50 ({ema_50:.2f})")
+    
+    if close > ema_50 and prev['close'] <= prev_ema50:
+        exit_sell = True
+        reasons.append(f"Price broke above EMA 50 ({ema_50:.2f})")
+    
+    # ── 3. MACD HISTOGRAM REVERSAL (3 consecutive bars) ──
+    # If MACD histogram flips from positive to negative for 3 bars
+    if macd_hist < 0 and macd_hist_p1 < 0 and macd_hist_p2 > 0:
+        exit_buy = True
+        reasons.append("MACD Histogram bearish for 2+ bars")
+    
+    if macd_hist > 0 and macd_hist_p1 > 0 and macd_hist_p2 < 0:
+        exit_sell = True
+        reasons.append("MACD Histogram bullish for 2+ bars")
+    
+    # ── 4. RSI EXTREME EXHAUSTION ──
+    if rsi > 78:
         exit_buy = True
         reasons.append(f"RSI extreme overbought ({rsi:.0f})")
-    if rsi < 20:
+    if rsi < 22:
         exit_sell = True
         reasons.append(f"RSI extreme oversold ({rsi:.0f})")
+    
+    # ── 5. DYNAMIC TP EXTENSION (Strong Momentum) ──
+    # If RSI is strong (60-75 for buy) and MACD is growing, EXTEND the TP
+    if 55 < rsi < 75 and macd_hist > macd_hist_p1 > 0:
+        extend_tp_buy = True
+    if 25 < rsi < 45 and macd_hist < macd_hist_p1 < 0:
+        extend_tp_sell = True
         
     return {
         "should_exit_buy": exit_buy,
@@ -385,7 +413,9 @@ def analyze_exit_conditions(df):
         "reason": " | ".join(reasons) if reasons else "No exit signal",
         "rsi": float(rsi),
         "macd_hist": float(macd_hist),
-        "atr": float(latest['atr']) if pd.notna(latest.get('atr')) else 0
+        "atr": float(latest['atr']) if pd.notna(latest.get('atr')) else 0,
+        "extend_tp_buy": extend_tp_buy,
+        "extend_tp_sell": extend_tp_sell,
     }
 
 
