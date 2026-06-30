@@ -6,3 +6,7 @@ MetaTrader5
 pandas
 numpy
 ta
+python-dotenv
+certifi
+bcrypt
+PyJWT

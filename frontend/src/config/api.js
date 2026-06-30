@@ -1,8 +1,8 @@
 // Central API configuration
 // In development: uses http://localhost:8000
-// In production (Vercel): uses your AWS VPS IP from environment variable
+// In production: uses relative paths (since FastAPI will serve the frontend)
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+const API_URL = import.meta.env.DEV ? 'http://localhost:8000' : '';
 
 if (!window.__fetchOverridden) {
   const originalFetch = window.fetch;
