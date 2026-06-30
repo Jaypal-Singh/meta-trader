@@ -21,7 +21,8 @@ const ChartPage = () => {
         const data = await res.json();
         const symData = data.find(s => s.name === symbol);
         if (symData && symData.configs && symData.configs.length > 0) {
-          setConfigs(symData.configs);
+          // Only load the FIRST config by default so the screen isn't cluttered
+          setConfigs([symData.configs[0]]);
         } else {
           // Default if no configs
           setConfigs([{ strategy: 'spirit', timeframe: 'H1', id: 'default' }]);
