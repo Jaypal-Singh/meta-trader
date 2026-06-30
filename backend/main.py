@@ -6,7 +6,9 @@ from routes_auth import router as auth_router
 from routes_trading import router as trading_router
 from routes_orders import router as orders_router
 from routes_funds import router as funds_router
+from routes_quant import router as quant_router
 from autotrade import auto_trade_loop
+from quant_engine import risk_monitor_loop
 import asyncio
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
@@ -26,11 +28,14 @@ app.include_router(auth_router, prefix="/api/auth", tags=["Auth"])
 app.include_router(trading_router, prefix="/api/trading", tags=["Trading"])
 app.include_router(orders_router, prefix="/api/orders", tags=["Orders"])
 app.include_router(funds_router, prefix="/api/funds", tags=["Funds"])
+app.include_router(quant_router, prefix="/api/quant", tags=["Quant Engine"])
 
 @app.on_event("startup")
 async def startup_event():
     # Run the background bot
     asyncio.create_task(auto_trade_loop())
+    # Run the isolated Quant Engine risk monitor
+    asyncio.create_task(risk_monitor_loop())
 
 @app.get("/api/status")
 async def read_status():

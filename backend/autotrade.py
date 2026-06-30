@@ -10,6 +10,7 @@ from database import db
 from mt5_logic import calculate_indicators, analyze_exit_conditions, get_market_data
 from strategies.soul import calculate_soul_signals
 from strategies.pulse import calculate_pulse_signals
+from strategies.apex import calculate_apex_signals
 from routes_orders import calc_pnl, execute_mt5_order, close_mt5_order
 
 # Track the last timestamp traded per symbol to avoid opening duplicate trades
@@ -309,9 +310,11 @@ async def scan_for_signals():
                     continue
                     
                 if active_strategy == "soul":
-                    df = calculate_soul_signals(df, symbol=symbol)
+                    df = calculate_soul_signals(df)
                 elif active_strategy == "pulse":
-                    df = calculate_pulse_signals(df, tp_mult=1.5, sl_mult=1.0, symbol=symbol)
+                    df = calculate_pulse_signals(df)
+                elif active_strategy == "apex":
+                    df = calculate_apex_signals(df)
                 else:
                     df = calculate_indicators(df, symbol=symbol)
                     
@@ -495,9 +498,11 @@ async def manage_open_positions():
         df = get_market_data(symbol, tf, 300)
         if df is not None and len(df) > 0:
             if active_strategy == "soul":
-                df_ind = calculate_soul_signals(df, symbol=symbol)
+                df_ind = calculate_soul_signals(df)
             elif active_strategy == "pulse":
-                df_ind = calculate_pulse_signals(df, tp_mult=1.5, sl_mult=1.0, symbol=symbol)
+                df_ind = calculate_pulse_signals(df)
+            elif active_strategy == "apex":
+                df_ind = calculate_apex_signals(df)
             else:
                 df_ind = calculate_indicators(df, symbol=symbol)
                 

@@ -6,6 +6,7 @@ MetaTrader5
 pandas
 numpy
 ta
+redis
 python-dotenv
 certifi
 bcrypt

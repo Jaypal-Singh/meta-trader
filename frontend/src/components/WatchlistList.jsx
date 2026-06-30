@@ -221,8 +221,8 @@ const WatchlistList = () => {
                     <X size={16} />
                   </button>
                   <label className="block text-xs font-bold text-gray-500 mb-1">Strategy</label>
-                  <div className="grid grid-cols-3 gap-1 mb-2">
-                    {['spirit', 'soul', 'pulse'].map(strat => (
+                  <div className="grid grid-cols-4 gap-1 mb-2">
+                    {['spirit', 'soul', 'pulse', 'apex'].map(strat => (
                       <button 
                         key={strat}
                         onClick={() => updateConfig(index, 'strategy', strat)}

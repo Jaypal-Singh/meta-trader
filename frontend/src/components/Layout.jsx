@@ -6,6 +6,7 @@ import FloatingWindow from './FloatingWindow';
 import OrdersPage from '../pages/OrdersPage';
 import StrategiesPage from '../pages/StrategiesPage';
 import AnalysisPage from '../pages/AnalysisPage';
+import BacktestPage from '../pages/BacktestPage';
 
 const Layout = () => {
   const location = useLocation();
@@ -91,6 +92,7 @@ const Layout = () => {
             <TopNavItem label="Orders" onClick={() => toggleWindow('orders')} isActive={openWindows.includes('orders')} />
             <TopNavItem label="Strategies" onClick={() => toggleWindow('strategies')} isActive={openWindows.includes('strategies')} />
             <TopNavItem label="Analysis" onClick={() => toggleWindow('analysis')} isActive={openWindows.includes('analysis')} />
+            <TopNavItem label="Backtest" onClick={() => toggleWindow('backtest')} isActive={openWindows.includes('backtest')} />
           </nav>
           <button 
             onClick={toggleTheme}
@@ -149,6 +151,16 @@ const Layout = () => {
                bringToFront={() => bringToFront('analysis')}
              >
                <AnalysisPage />
+             </FloatingWindow>
+           )}
+           {openWindows.includes('backtest') && (
+             <FloatingWindow 
+               id="backtest" title="Quant Engine Simulator" 
+               onClose={() => toggleWindow('backtest')} 
+               zIndex={activeWindow === 'backtest' ? 100 : 50}
+               bringToFront={() => bringToFront('backtest')}
+             >
+               <BacktestPage />
              </FloatingWindow>
            )}
         </main>
