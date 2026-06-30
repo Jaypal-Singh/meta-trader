@@ -15,7 +15,7 @@ def init_mt5(account: int, password: str, server: str):
     print("Connected to MT5 successfully!")
     return True
 
-def get_market_data(symbol: str, timeframe=mt5.TIMEFRAME_M5, num_bars: int = 2000):
+def get_market_data(symbol: str, timeframe=mt5.TIMEFRAME_H1, num_bars: int = 2000):
     rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, num_bars)
     if rates is None or len(rates) == 0:
         return None
@@ -34,7 +34,7 @@ _htf_cache = {"symbol": None, "time": None, "trend": None}
 
 def get_higher_tf_trend(symbol: str):
     """
-    Fetch M15 data (3× the M5 trading timeframe) to determine the
+    Fetch H4 data (4× the H1 trading timeframe) to determine the
     dominant trend direction. Returns 'BULLISH', 'BEARISH', or 'NEUTRAL'.
     
     Uses EMA 50 vs EMA 200 crossover on the higher timeframe.
@@ -48,7 +48,7 @@ def get_higher_tf_trend(symbol: str):
         now - _htf_cache["time"] < 60):
         return _htf_cache["trend"]
     
-    htf_rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M15, 0, 300)
+    htf_rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_H4, 0, 300)
     if htf_rates is None or len(htf_rates) < 210:
         _htf_cache.update({"symbol": symbol, "time": now, "trend": "NEUTRAL"})
         return "NEUTRAL"

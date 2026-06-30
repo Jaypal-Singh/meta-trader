@@ -15,7 +15,7 @@ const Dashboard = () => {
         <div className="bg-white dark:bg-[#1e293b] p-6 rounded-full mb-6 shadow-xl border border-gray-200 dark:border-gray-800 transition-colors duration-200">
           <Activity size={48} className="text-emerald-500" />
         </div>
-        <h2 className="text-2xl font-bold text-gray-800 dark:text-white mb-2">Welcome to GUARDEER PRO</h2>
+        <h2 className="text-2xl font-bold text-gray-800 dark:text-white mb-2">Welcome to SPIRIT PRO</h2>
         <p className="text-sm font-medium">Select an instrument from the Watchlist to view its chart</p>
       </div>
     </>

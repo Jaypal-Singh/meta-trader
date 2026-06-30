@@ -44,7 +44,7 @@ const Login = () => {
             <Activity className="w-8 h-8 text-trading-buy" />
           </div>
           <h2 className="text-3xl font-extrabold text-white tracking-tight">
-            GUARDEER PRO
+            SPIRIT PRO
           </h2>
           <p className="mt-2 text-sm text-trading-muted font-medium">
             Institutional Grade Trading Terminal

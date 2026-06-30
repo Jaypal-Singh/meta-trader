@@ -3,9 +3,13 @@ import MetaTrader5 as mt5
 from datetime import datetime, timezone, timedelta
 import random
 import pandas as pd
+import os
+import csv
 
 from database import db
-from mt5_logic import get_market_data, calculate_indicators, analyze_exit_conditions
+from mt5_logic import calculate_indicators, analyze_exit_conditions, get_market_data
+from strategies.soul import calculate_soul_signals
+from strategies.pulse import calculate_pulse_signals
 from routes_orders import calc_pnl, execute_mt5_order, close_mt5_order
 
 # Track the last timestamp traded per symbol to avoid opening duplicate trades
@@ -32,7 +36,7 @@ MAX_OPEN_TRADES_PER_SYMBOL = 1    # Max 1 trade per symbol at a time
 DAILY_LOSS_LIMIT_PCT = 3.0         # Stop trading if daily loss > 3% of balance
 CONSECUTIVE_LOSS_COOLDOWN = 3      # After 3 consecutive losses...
 COOLDOWN_MINUTES = 15              # ...wait 15 minutes before next trade
-MAX_TRADE_AGE_CANDLES = 60         # Close stale trades after 60 candles (5 hours on M5)
+MAX_TRADE_AGE_CANDLES = 60         # Close stale trades after 60 candles (60 hours on H1)
 FLAT_TRADE_CANDLES = 20            # Close if in profit but flat for 20 candles
 MAX_SPREAD_MULTIPLIER = 2.0       # Don't trade if spread > 2× average
 
@@ -41,6 +45,54 @@ TRAIL_STAGE_1_TRIGGER = 1.0   # Price reaches 1.0× ATR profit → SL to breakev
 TRAIL_STAGE_2_TRIGGER = 1.5   # Price reaches 1.5× ATR profit → SL to +0.5× ATR
 TRAIL_STAGE_3_TRIGGER = 2.0   # Price reaches 2.0× ATR profit → SL to +1.0× ATR
 TRAIL_CONTINUOUS_OFFSET = 1.0  # After stage 3: always trail at 1.0× ATR behind
+
+CSV_FILE_PATH = "trade_analysis.csv"
+
+def log_trade_to_csv(action: str, order: dict, reason: str = ""):
+    """Log trade to CSV for analysis."""
+    file_exists = os.path.isfile(CSV_FILE_PATH)
+    with open(CSV_FILE_PATH, mode='a', newline='') as f:
+        fieldnames = [
+            "timestamp", "action", "username", "ticket", "symbol", "order_type", 
+            "strategy", "timeframe", "open_price", "close_price", "sl", "tp", 
+            "pnl", "net_pnl", "result", "roi_percent", "duration_candles", "reason"
+        ]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+            
+        net_pnl = order.get("pnl", 0.0) + order.get("commission", 0.0) + order.get("swap", 0.0) if action == "CLOSE" else 0.0
+        
+        result = ""
+        roi_percent = 0.0
+        if action == "CLOSE":
+            result = "PROFIT" if net_pnl > 0 else ("LOSS" if net_pnl < 0 else "BREAKEVEN")
+            # Calculate simple price percentage movement (assuming 1:100 leverage equivalence or just raw PNL vs approx margin)
+            # Assuming 0.1 lot = 10,000 units. Margin = 100.
+            # Let's just use a fixed 100k balance for ROI % or relative to position size.
+            roi_percent = round((net_pnl / 1000.0) * 100, 2) # Example: relative to $1000 margin
+            
+        writer.writerow({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "action": action,
+            "username": order.get("username"),
+            "ticket": order.get("ticket"),
+            "symbol": order.get("symbol"),
+            "order_type": order.get("order_type"),
+            "strategy": order.get("strategy", "unknown"),
+            "timeframe": order.get("timeframe", "unknown"),
+            "open_price": order.get("open_price"),
+            "close_price": order.get("close_price", ""),
+            "sl": order.get("sl", ""),
+            "tp": order.get("tp", ""),
+            "pnl": order.get("pnl", 0.0),
+            "net_pnl": net_pnl,
+            "result": result,
+            "roi_percent": roi_percent,
+            "duration_candles": order.get("open_candle_count", 0),
+            "reason": reason
+        })
+
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -83,20 +135,7 @@ async def check_daily_loss_limit(username: str) -> bool:
 
 
 def check_consecutive_loss_cooldown(username: str) -> bool:
-    """Returns True if we're past cooldown period after consecutive losses."""
-    tracker = consecutive_losses.get(username, {"count": 0, "last_loss_time": None})
-    
-    if tracker["count"] >= CONSECUTIVE_LOSS_COOLDOWN:
-        if tracker["last_loss_time"]:
-            cooldown_end = tracker["last_loss_time"] + timedelta(minutes=COOLDOWN_MINUTES)
-            if datetime.now(timezone.utc) < cooldown_end:
-                remaining = (cooldown_end - datetime.now(timezone.utc)).seconds // 60
-                print(f"[AutoTrade] ⏳ Cooldown active for {username}: {remaining}m remaining after {tracker['count']} consecutive losses")
-                return False
-            else:
-                # Cooldown expired, reset
-                consecutive_losses[username] = {"count": 0, "last_loss_time": None}
-    
+    """Returns True. Cooldown logic disabled."""
     return True
 
 
@@ -147,7 +186,7 @@ def record_trade_result(username: str, pnl: float):
 #  TRADE EXECUTION
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-async def execute_trade(username: str, symbol: str, order_type: str, candle: pd.Series):
+async def execute_trade(username: str, symbol: str, order_type: str, candle: pd.Series, strategy: str, timeframe: str):
     """Executes a trade and saves it to the database."""
     tick = mt5.symbol_info_tick(symbol)
     if not tick:
@@ -158,7 +197,8 @@ async def execute_trade(username: str, symbol: str, order_type: str, candle: pd.
     # Simple margin logic
     funds = await db.funds.find_one({"username": username})
     if not funds:
-        return # Cannot trade without a funds document
+        await db.funds.insert_one({"username": username, "balance": 100000.0, "equity": 100000.0, "available_margin": 100000.0, "used_margin": 0.0, "floating_pnl": 0.0})
+        funds = await db.funds.find_one({"username": username})
 
     # Store ATR value for trailing stop calculations
     atr_val = float(candle['atr']) if pd.notna(candle.get('atr')) else None
@@ -190,6 +230,8 @@ async def execute_trade(username: str, symbol: str, order_type: str, candle: pd.
         "username": username,
         "symbol": symbol,
         "order_type": order_type,
+        "strategy": strategy,
+        "timeframe": timeframe,
         "lot_size": DEFAULT_LOT_SIZE,
         "open_price": executed_price,
         "current_price": executed_price,
@@ -211,7 +253,8 @@ async def execute_trade(username: str, symbol: str, order_type: str, candle: pd.
     }
     
     await db.orders.insert_one(order)
-    print(f"[AutoTrade] ✅ Opened {order_type} on {symbol} at {open_price} for {username} (Ticket: {ticket}) | SL: {order['sl']} | TP: {order['tp']}")
+    log_trade_to_csv("OPEN", order, reason="Signal Entry")
+    print(f"[AutoTrade] ✅ Opened {order_type} on {symbol} ({strategy}/{timeframe}) at {open_price} for {username} (Ticket: {ticket}) | SL: {order['sl']} | TP: {order['tp']}")
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -220,23 +263,28 @@ async def execute_trade(username: str, symbol: str, order_type: str, candle: pd.
 
 async def scan_for_signals():
     """Scans enabled symbols per user for new GUARDEER PRO v2 signals with risk management."""
-    users = await db.users.find({}).to_list(1000)
-    if not users:
-        return
-        
+    users = await db.users.find().to_list(100)
+    
     for user in users:
-        username = user['username']
-        symbols = user.get("autotrade_symbols", [])
+        username = user.get("username")
+        watchlist_config = user.get("watchlist_config", {})
         
         # ── RISK CHECK 1: Daily loss limit ──
         if not await check_daily_loss_limit(username):
             continue
         
-        # ── RISK CHECK 2: Consecutive loss cooldown ──
-        if not check_consecutive_loss_cooldown(username):
-            continue
-        
-        for symbol in symbols:
+        # ── RISK CHECK 2: Consecutive loss cooldown (DISABLED) ──
+        # if not check_consecutive_loss_cooldown(username):
+        #     continue
+            
+        for symbol, configs in watchlist_config.items():
+            if isinstance(configs, dict):
+                configs = [configs]
+                
+            active_configs = [c for c in configs if c.get("autotrade", False)]
+            if not active_configs:
+                continue
+                
             # ── RISK CHECK 3: Max trades per symbol ──
             if not await check_max_trades_per_symbol(username, symbol):
                 continue
@@ -245,27 +293,44 @@ async def scan_for_signals():
             if not check_spread(symbol):
                 continue
             
-            df = get_market_data(symbol, mt5.TIMEFRAME_M5, 300)
-            if df is None or len(df) == 0:
-                continue
+            for sym_config in active_configs:
+                active_strategy = sym_config.get("strategy", "spirit")
+                timeframe_str = sym_config.get("timeframe", "H1")
                 
-            df = calculate_indicators(df, symbol=symbol)
-            if df is None or len(df) == 0:
-                continue
+                tf_map = {
+                    "M1": mt5.TIMEFRAME_M1, "M5": mt5.TIMEFRAME_M5, "M15": mt5.TIMEFRAME_M15,
+                    "M30": mt5.TIMEFRAME_M30, "H1": mt5.TIMEFRAME_H1, "H4": mt5.TIMEFRAME_H4,
+                    "D1": mt5.TIMEFRAME_D1, "W1": mt5.TIMEFRAME_W1, "MN": mt5.TIMEFRAME_MN1
+                }
+                tf = tf_map.get(timeframe_str, mt5.TIMEFRAME_H1)
                 
-            latest = df.iloc[-1]
-            sig = latest['signal']
-            
-            # If there is an active signal on the latest candle
-            if pd.notna(sig) and sig in ('BUY', 'SELL'):
-                signal_time = int(latest['raw_time'])
+                df = get_market_data(symbol, tf, 300)
+                if df is None or len(df) == 0:
+                    continue
+                    
+                if active_strategy == "soul":
+                    df = calculate_soul_signals(df, symbol=symbol)
+                elif active_strategy == "pulse":
+                    df = calculate_pulse_signals(df, tp_mult=1.5, sl_mult=1.0, symbol=symbol)
+                else:
+                    df = calculate_indicators(df, symbol=symbol)
+                    
+                if df is None or len(df) == 0:
+                    continue
+                    
+                latest = df.iloc[-1]
+                sig = latest['signal']
                 
-                key = f"{username}_{symbol}"
-                
-                # Check if we already traded this specific signal (on this candle)
-                if last_traded_signals.get(key) != signal_time:
-                    last_traded_signals[key] = signal_time
-                    await execute_trade(username, symbol, sig, latest)
+                # If there is an active signal on the latest candle
+                if pd.notna(sig) and sig in ('BUY', 'SELL'):
+                    signal_time = int(latest['raw_time'])
+                    
+                    key = f"{username}_{symbol}_{active_strategy}_{timeframe_str}"
+                    
+                    # Check if we already traded this specific signal
+                    if last_traded_signals.get(key) != signal_time:
+                        last_traded_signals[key] = signal_time
+                        await execute_trade(username, symbol, sig, latest, active_strategy, timeframe_str)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -320,6 +385,12 @@ async def close_position(order: dict, current_price: float, reason: str):
     
     # Record result for risk management
     record_trade_result(order["username"], net_pnl)
+    
+    # Log to CSV
+    updated_order = {**order, "close_price": actual_close_price, "pnl": pnl, "status": "closed"}
+    updated_order["commission"] = order.get("commission", 0)
+    updated_order["swap"] = order.get("swap", 0)
+    log_trade_to_csv("CLOSE", updated_order, reason=reason)
     
     emoji = "💰" if net_pnl >= 0 else "🔻"
     print(f"[AutoTrade] {emoji} Closed {order['order_type']} on {symbol} (Ticket: {order['ticket']}) | Reason: {reason} | Net PNL: ${net_pnl:.2f}")
@@ -401,7 +472,7 @@ async def manage_open_positions():
             pnl = calc_pnl(order["order_type"], open_price, current_price, order["lot_size"], symbol)
             if pnl > 0:
                 # Check if price hasn't moved much in recent candles
-                df = get_market_data(symbol, mt5.TIMEFRAME_M5, FLAT_TRADE_CANDLES + 5)
+                df = get_market_data(symbol, mt5.TIMEFRAME_H1, FLAT_TRADE_CANDLES + 5)
                 if df is not None and len(df) >= FLAT_TRADE_CANDLES:
                     recent_range = df['high'].iloc[-FLAT_TRADE_CANDLES:].max() - df['low'].iloc[-FLAT_TRADE_CANDLES:].min()
                     if atr_at_entry and recent_range < atr_at_entry * 0.5:
@@ -412,9 +483,24 @@ async def manage_open_positions():
         # EXIT CHECK 3: Smart Early Exit (Chart Analysis)
         # ════════════════════════════════════════════════════════════
         
-        df = get_market_data(symbol, mt5.TIMEFRAME_M5, 300)
+        active_strategy = order.get("strategy", "spirit")
+        timeframe_str = order.get("timeframe", "H1")
+        
+        tf_map = {
+            "M1": mt5.TIMEFRAME_M1, "M5": mt5.TIMEFRAME_M5, "M15": mt5.TIMEFRAME_M15,
+            "H1": mt5.TIMEFRAME_H1, "H4": mt5.TIMEFRAME_H4, "D1": mt5.TIMEFRAME_D1
+        }
+        tf = tf_map.get(timeframe_str, mt5.TIMEFRAME_H1)
+        
+        df = get_market_data(symbol, tf, 300)
         if df is not None and len(df) > 0:
-            df_ind = calculate_indicators(df, symbol=symbol)
+            if active_strategy == "soul":
+                df_ind = calculate_soul_signals(df, symbol=symbol)
+            elif active_strategy == "pulse":
+                df_ind = calculate_pulse_signals(df, tp_mult=1.5, sl_mult=1.0, symbol=symbol)
+            else:
+                df_ind = calculate_indicators(df, symbol=symbol)
+                
             if df_ind is not None and len(df_ind) > 0:
                 # ── 3A: Opposite signal detected ──
                 latest = df_ind.iloc[-1]
@@ -427,22 +513,28 @@ async def manage_open_positions():
                         await close_position(order, current_price, "Trend Reversal (BUY signal)")
                         continue
                 
-                # ── 3B: RSI/MACD/EMA Pattern-based early exit ──
-                exit_analysis = analyze_exit_conditions(df_ind)
-                
-                if order["order_type"] == "BUY" and exit_analysis["should_exit_buy"]:
-                    pnl = calc_pnl(order["order_type"], open_price, current_price, order["lot_size"], symbol)
-                    # Exit losing trades immediately on reversal signal
-                    # Exit winning trades only if reversal is confirmed (EMA cross or price break)
-                    if pnl <= 0 or trail_stage >= 1:
-                        await close_position(order, current_price, f"Smart Exit BUY: {exit_analysis['reason']}")
-                        continue
-                
-                elif order["order_type"] == "SELL" and exit_analysis["should_exit_sell"]:
-                    pnl = calc_pnl(order["order_type"], open_price, current_price, order["lot_size"], symbol)
-                    if pnl <= 0 or trail_stage >= 1:
-                        await close_position(order, current_price, f"Smart Exit SELL: {exit_analysis['reason']}")
-                        continue
+                # ── 3B: RSI/MACD/EMA Pattern-based early exit (Guardeer & Pulse) ──
+                exit_analysis = {}
+                if active_strategy == "spirit":
+                    exit_analysis = analyze_exit_conditions(df_ind)
+                elif active_strategy == "pulse":
+                    from strategies.pulse import analyze_pulse_exit_conditions
+                    exit_analysis = analyze_pulse_exit_conditions(df_ind)
+                    
+                if exit_analysis:
+                    if order["order_type"] == "BUY" and exit_analysis.get("should_exit_buy"):
+                        pnl = calc_pnl(order["order_type"], open_price, current_price, order["lot_size"], symbol)
+                        # Exit losing trades immediately on reversal signal
+                        # Exit winning trades only if reversal is confirmed (or immediately for fast 'pulse' scalps)
+                        if pnl <= 0 or trail_stage >= 1 or active_strategy == "pulse":
+                            await close_position(order, current_price, f"Smart Exit BUY: {exit_analysis.get('reason', '')}")
+                            continue
+                    
+                    elif order["order_type"] == "SELL" and exit_analysis.get("should_exit_sell"):
+                        pnl = calc_pnl(order["order_type"], open_price, current_price, order["lot_size"], symbol)
+                        if pnl <= 0 or trail_stage >= 1 or active_strategy == "pulse":
+                            await close_position(order, current_price, f"Smart Exit SELL: {exit_analysis.get('reason', '')}")
+                            continue
                 
                 # ── 3C: Dynamic TP Extension (Push TP further when momentum is strong) ──
                 if tp and atr_at_entry and atr_at_entry > 0:

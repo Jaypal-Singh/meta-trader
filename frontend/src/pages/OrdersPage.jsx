@@ -110,7 +110,7 @@ const OrderCard = ({ order, isOpen, onExit }) => {
               </span>
             </div>
             <p className="text-[11px] text-gray-400 dark:text-gray-500 font-medium mb-1.5">
-              SPOT · {tag}
+              SPOT · {tag} {order.strategy && `· STRATEGY: ${order.strategy.toUpperCase()}`} {order.timeframe && `· TF: ${order.timeframe}`}
             </p>
             <div className="flex items-center space-x-2">
               <span className={`text-[11px] font-bold px-2 py-0.5 rounded

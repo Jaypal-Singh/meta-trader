@@ -13,6 +13,52 @@ import jwt
 import random
 import string
 import MetaTrader5 as mt5
+import os
+import csv
+
+CSV_FILE_PATH = "trade_analysis.csv"
+
+def log_trade_to_csv(action: str, order: dict, reason: str = ""):
+    file_exists = os.path.isfile(CSV_FILE_PATH)
+    with open(CSV_FILE_PATH, mode='a', newline='') as f:
+        fieldnames = [
+            "timestamp", "action", "username", "ticket", "symbol", "order_type", 
+            "strategy", "timeframe", "open_price", "close_price", "sl", "tp", 
+            "pnl", "net_pnl", "result", "roi_percent", "duration_candles", "reason"
+        ]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+            
+        net_pnl = order.get("pnl", 0.0) + order.get("commission", 0.0) + order.get("swap", 0.0) if action == "CLOSE" else 0.0
+        
+        result = ""
+        roi_percent = 0.0
+        if action == "CLOSE":
+            result = "PROFIT" if net_pnl > 0 else ("LOSS" if net_pnl < 0 else "BREAKEVEN")
+            roi_percent = round((net_pnl / 1000.0) * 100, 2)
+            
+        writer.writerow({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "action": action,
+            "username": order.get("username"),
+            "ticket": order.get("ticket"),
+            "symbol": order.get("symbol"),
+            "order_type": order.get("order_type"),
+            "strategy": order.get("strategy", "manual"),
+            "timeframe": order.get("timeframe", "unknown"),
+            "open_price": order.get("open_price"),
+            "close_price": order.get("close_price", ""),
+            "sl": order.get("sl", ""),
+            "tp": order.get("tp", ""),
+            "pnl": order.get("pnl", 0.0),
+            "net_pnl": net_pnl,
+            "result": result,
+            "roi_percent": roi_percent,
+            "duration_candles": order.get("open_candle_count", 0),
+            "reason": reason
+        })
+
 
 router = APIRouter()
 
@@ -40,6 +86,8 @@ class CreateOrderRequest(BaseModel):
     order_type: str  # "BUY" or "SELL"
     lot_size: float = 0.01
     open_price: float
+    strategy: Optional[str] = "manual"
+    timeframe: Optional[str] = "unknown"
     sl: Optional[float] = None
     tp: Optional[float] = None
     comment: Optional[str] = ""
@@ -266,6 +314,8 @@ async def create_order(req: CreateOrderRequest, username: str = Depends(get_curr
         "username": username,
         "symbol": req.symbol.upper(),
         "order_type": req.order_type.upper(),
+        "strategy": req.strategy,
+        "timeframe": req.timeframe,
         "lot_size": req.lot_size,
         "open_price": executed_price,
         "current_price": executed_price,
@@ -280,10 +330,12 @@ async def create_order(req: CreateOrderRequest, username: str = Depends(get_curr
         "open_time": datetime.now(timezone.utc).isoformat(),
         "close_time": None,
         "close_price": None,
+        "open_candle_count": 0,
     }
 
     result = await db.orders.insert_one(order)
     order["_id"] = str(result.inserted_id)
+    log_trade_to_csv("OPEN", order, reason="Manual Entry")
     return order
 
 
@@ -337,6 +389,7 @@ async def close_order(ticket: str, req: CloseOrderRequest, username: str = Depen
     )
 
     updated = await db.orders.find_one({"ticket": ticket, "username": username})
+    log_trade_to_csv("CLOSE", updated, reason="Manual Close")
     return serialize_order(updated)
 
 
