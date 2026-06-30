@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pydantic
+motor
+MetaTrader5
+pandas
+numpy
+ta
