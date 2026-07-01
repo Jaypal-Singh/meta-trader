@@ -54,9 +54,9 @@ def calculate_swing_volume_profile(df, start_idx, end_idx, vp_rows=12):
     }
 
 
-def calculate_soul_signals(df: pd.DataFrame, symbol: str = None) -> pd.DataFrame:
+def calculate_soul_signals(df: pd.DataFrame, symbol: str = None, tp_mult: float = 1.0, sl_mult: float = 0.5) -> pd.DataFrame:
     """
-    Soul — Swing VP Pro Strategy (Exact Pine Script Translation)
+    SOUL Strategy - Trend following with ATR trailing stops and Smart Volume.
     
     Original Pine Script: "all free courses tg- @sarpanch0000"
     

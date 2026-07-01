@@ -51,6 +51,15 @@ async def toggle_autotrade_symbol(req: AutotradeRequest, username: str = Depends
         if configs and "id" not in configs[0]:
             import uuid
             configs[0]["id"] = uuid.uuid4().hex[:8]
+            
+    if not configs:
+        import uuid
+        configs = [{
+            "id": uuid.uuid4().hex[:8],
+            "strategy": "spirit",
+            "timeframe": "H1",
+            "autotrade": False
+        }]
     
     any_active = any(c.get("autotrade", False) for c in configs)
     new_state = not any_active
@@ -253,8 +262,12 @@ def get_chart_data(symbol: str, timeframe: str = "H1", strategy: str = "spirit")
         from strategies.soul import calculate_soul_signals
         df_with_signals = calculate_soul_signals(df_with_signals, symbol=symbol)
     elif strategy == "pulse":
-        from strategies.pulse import calculate_pulse_signals
-        df_with_signals = calculate_pulse_signals(df_with_signals, tp_mult=1.5, sl_mult=1.0, symbol=symbol)
+        if symbol == "GBPUSD" and timeframe.upper() == "M30":
+            from strategies.pulse_gbpusd_m30 import calculate_pulse_gbpusd_m30_signals
+            df_with_signals = calculate_pulse_gbpusd_m30_signals(df_with_signals, tp_mult=1.5, sl_mult=1.0, symbol=symbol)
+        else:
+            from strategies.pulse import calculate_pulse_signals
+            df_with_signals = calculate_pulse_signals(df_with_signals, tp_mult=1.5, sl_mult=1.0, symbol=symbol)
         
     if df_with_signals is None:
         raise HTTPException(status_code=500, detail="Failed to calculate indicators")
@@ -382,8 +395,12 @@ async def get_strategies_performance(username: str = Depends(get_current_user)):
                     from strategies.soul import calculate_soul_signals
                     df_ind = calculate_soul_signals(df_ind, symbol=symbol)
                 elif strategy == "pulse":
-                    from strategies.pulse import calculate_pulse_signals
-                    df_ind = calculate_pulse_signals(df_ind, tp_mult=1.5, sl_mult=1.0, symbol=symbol)
+                    if symbol == "GBPUSD" and timeframe_str == "M30":
+                        from strategies.pulse_gbpusd_m30 import calculate_pulse_gbpusd_m30_signals
+                        df_ind = calculate_pulse_gbpusd_m30_signals(df_ind, tp_mult=1.5, sl_mult=1.0, symbol=symbol)
+                    else:
+                        from strategies.pulse import calculate_pulse_signals
+                        df_ind = calculate_pulse_signals(df_ind, tp_mult=1.5, sl_mult=1.0, symbol=symbol)
                     
                 if df_ind is not None:
                     accuracy = calculate_accuracy(df_ind)

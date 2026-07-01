@@ -7,7 +7,7 @@ import os
 import csv
 
 from database import db
-from mt5_logic import calculate_indicators, analyze_exit_conditions, get_market_data
+from mt5_logic import calculate_indicators, analyze_exit_conditions, get_market_data, get_higher_tf_trend
 from strategies.soul import calculate_soul_signals
 from strategies.pulse import calculate_pulse_signals
 from strategies.apex import calculate_apex_signals
@@ -42,10 +42,10 @@ FLAT_TRADE_CANDLES = 20            # Close if in profit but flat for 20 candles
 MAX_SPREAD_MULTIPLIER = 2.0       # Don't trade if spread > 2× average
 
 # Trailing stop stages (in ATR multiples)
-TRAIL_STAGE_1_TRIGGER = 1.0   # Price reaches 1.0× ATR profit → SL to breakeven
-TRAIL_STAGE_2_TRIGGER = 1.5   # Price reaches 1.5× ATR profit → SL to +0.5× ATR
-TRAIL_STAGE_3_TRIGGER = 2.0   # Price reaches 2.0× ATR profit → SL to +1.0× ATR
-TRAIL_CONTINUOUS_OFFSET = 1.0  # After stage 3: always trail at 1.0× ATR behind
+TRAIL_STAGE_1_TRIGGER = 0.5   # Price reaches 0.5× ATR profit → SL to breakeven
+TRAIL_STAGE_2_TRIGGER = 1.0   # Price reaches 1.0× ATR profit → SL to +0.5× ATR
+TRAIL_STAGE_3_TRIGGER = 1.5   # Price reaches 1.5× ATR profit → SL to +1.0× ATR
+TRAIL_CONTINUOUS_OFFSET = 0.5  # After stage 3: always trail at 0.5× ATR behind
 
 CSV_FILE_PATH = "trade_analysis.csv"
 
@@ -286,6 +286,9 @@ async def scan_for_signals():
             if not active_configs:
                 continue
                 
+            if symbol == "XAUEUR":
+                continue
+                
             # MUST select the symbol in MT5 Market Watch to get live ticks and rates
             mt5.symbol_select(symbol, True)
                 
@@ -301,6 +304,15 @@ async def scan_for_signals():
                 active_strategy = sym_config.get("strategy", "spirit")
                 timeframe_str = sym_config.get("timeframe", "H1")
                 
+                # ── RISK CHECK 5: Timeframe & Noise Filter ──
+                if active_strategy in ["soul", "spirit"] and timeframe_str in ["M1", "M5"]:
+                    # print(f"[AutoTrade] ⚠️ Skipping {symbol} {active_strategy} on {timeframe_str} (Too much noise)")
+                    continue
+                
+                if active_strategy == "pulse" and timeframe_str in ["M1", "M5"]:
+                    # print(f"[AutoTrade] ⚠️ Skipping {symbol} pulse on {timeframe_str} (Spread too high for scalping)")
+                    continue
+                
                 tf_map = {
                     "M1": mt5.TIMEFRAME_M1, "M5": mt5.TIMEFRAME_M5, "M15": mt5.TIMEFRAME_M15,
                     "M30": mt5.TIMEFRAME_M30, "H1": mt5.TIMEFRAME_H1, "H4": mt5.TIMEFRAME_H4,
@@ -315,7 +327,11 @@ async def scan_for_signals():
                 if active_strategy == "soul":
                     df = calculate_soul_signals(df)
                 elif active_strategy == "pulse":
-                    df = calculate_pulse_signals(df)
+                    if symbol == "GBPUSD" and timeframe_str == "M30":
+                        from strategies.pulse_gbpusd_m30 import calculate_pulse_gbpusd_m30_signals
+                        df = calculate_pulse_gbpusd_m30_signals(df)
+                    else:
+                        df = calculate_pulse_signals(df)
                 elif active_strategy == "apex":
                     df = calculate_apex_signals(df)
                 else:
@@ -325,18 +341,42 @@ async def scan_for_signals():
                     continue
                     
                 latest = df.iloc[-1]
-                sig = latest['signal']
                 
-                # If there is an active signal on the latest candle
-                if pd.notna(sig) and sig in ('BUY', 'SELL'):
-                    signal_time = int(latest['raw_time'])
+                # Get all rows with a signal
+                signals_df = df.dropna(subset=['signal'])
+                if signals_df.empty:
+                    continue
                     
-                    key = f"{username}_{symbol}_{active_strategy}_{timeframe_str}"
-                    
-                    # Check if we already traded this specific signal
-                    if last_traded_signals.get(key) != signal_time:
-                        last_traded_signals[key] = signal_time
-                        await execute_trade(username, symbol, sig, latest, active_strategy, timeframe_str)
+                last_signal_row = signals_df.iloc[-1]
+                sig = last_signal_row['signal']
+                signal_time = int(last_signal_row['raw_time'])
+                
+                # Check if the signal occurred within the last 5 candles
+                # (Spirit and Soul strategies confirm signals retrospectively on prior candles)
+                if df.index[-1] - last_signal_row.name <= 5:
+                    if pd.notna(sig) and sig in ('BUY', 'SELL'):
+                        # ── HTF TREND FILTER for Soul & Spirit ──
+                        if active_strategy in ["soul", "spirit"]:
+                            htf_trend = get_higher_tf_trend(symbol, tf, mt5)
+                            if sig == 'BUY' and htf_trend == -1:
+                                print(f"[AutoTrade] ⚠️ Skipping BUY on {symbol} {active_strategy} (HTF is DOWN)")
+                                continue
+                            if sig == 'SELL' and htf_trend == 1:
+                                print(f"[AutoTrade] ⚠️ Skipping SELL on {symbol} {active_strategy} (HTF is UP)")
+                                continue
+                                
+                        key = f"{username}_{symbol}_{active_strategy}_{timeframe_str}"
+                        
+                        # Check if we already traded this specific signal
+                        if last_traded_signals.get(key) != signal_time:
+                            last_traded_signals[key] = signal_time
+                            
+                            # Merge SL/TP from the signal bar with the latest market data
+                            trade_candle = latest.copy()
+                            trade_candle['sl'] = last_signal_row['sl']
+                            trade_candle['tp'] = last_signal_row['tp']
+                            
+                            await execute_trade(username, symbol, sig, trade_candle, active_strategy, timeframe_str)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -503,7 +543,11 @@ async def manage_open_positions():
             if active_strategy == "soul":
                 df_ind = calculate_soul_signals(df)
             elif active_strategy == "pulse":
-                df_ind = calculate_pulse_signals(df)
+                if symbol == "GBPUSD" and timeframe_str == "M30":
+                    from strategies.pulse_gbpusd_m30 import calculate_pulse_gbpusd_m30_signals
+                    df_ind = calculate_pulse_gbpusd_m30_signals(df)
+                else:
+                    df_ind = calculate_pulse_signals(df)
             elif active_strategy == "apex":
                 df_ind = calculate_apex_signals(df)
             else:
@@ -512,37 +556,56 @@ async def manage_open_positions():
             if df_ind is not None and len(df_ind) > 0:
                 # ── 3A: Opposite signal detected ──
                 latest = df_ind.iloc[-1]
-                sig = latest['signal']
-                if pd.notna(sig):
-                    if order["order_type"] == "BUY" and sig == "SELL":
-                        await close_position(order, current_price, "Trend Reversal (SELL signal)")
-                        continue
-                    elif order["order_type"] == "SELL" and sig == "BUY":
-                        await close_position(order, current_price, "Trend Reversal (BUY signal)")
-                        continue
-                
+                signals_df = df_ind.dropna(subset=['signal'])
+                if not signals_df.empty:
+                    last_signal_row = signals_df.iloc[-1]
+                    if df_ind.index[-1] - last_signal_row.name <= 5:
+                        sig = last_signal_row['signal']
+                        if order["order_type"] == "BUY" and sig == "SELL":
+                            await close_position(order, current_price, "Trend Reversal (SELL signal)")
+                            continue
+                        elif order["order_type"] == "SELL" and sig == "BUY":
+                            await close_position(order, current_price, "Trend Reversal (BUY signal)")
+                            continue
+                            
                 # ── 3B: RSI/MACD/EMA Pattern-based early exit (Guardeer & Pulse) ──
                 exit_analysis = {}
-                if active_strategy == "spirit":
+                if active_strategy in ["spirit", "soul"]:
+                    # Calculate basic indicators for exit analysis if not present
+                    if "ema_21" not in df_ind.columns:
+                        # Add basic indicators without modifying signals
+                        df_ind['ema_21'] = df_ind['close'].ewm(span=21, adjust=False).mean()
+                        df_ind['ema_50'] = df_ind['close'].ewm(span=50, adjust=False).mean()
+                        ema_12 = df_ind['close'].ewm(span=12, adjust=False).mean()
+                        ema_26 = df_ind['close'].ewm(span=26, adjust=False).mean()
+                        df_ind['macd_line'] = ema_12 - ema_26
+                        df_ind['macd_signal'] = df_ind['macd_line'].ewm(span=9, adjust=False).mean()
+                        df_ind['macd_hist'] = df_ind['macd_line'] - df_ind['macd_signal']
+                        delta = df_ind['close'].diff()
+                        gain = delta.clip(lower=0)
+                        loss = -delta.clip(upper=0)
+                        rs = gain.ewm(com=13, adjust=False).mean() / (loss.ewm(com=13, adjust=False).mean() + 1e-10)
+                        df_ind['rsi'] = 100 - (100 / (1 + rs))
+                    
                     exit_analysis = analyze_exit_conditions(df_ind)
                 elif active_strategy == "pulse":
-                    from strategies.pulse import analyze_pulse_exit_conditions
-                    exit_analysis = analyze_pulse_exit_conditions(df_ind)
+                    if symbol == "GBPUSD" and timeframe_str == "M30":
+                        from strategies.pulse_gbpusd_m30 import analyze_pulse_gbpusd_m30_exit_conditions
+                        exit_analysis = analyze_pulse_gbpusd_m30_exit_conditions(df_ind)
+                    else:
+                        from strategies.pulse import analyze_pulse_exit_conditions
+                        exit_analysis = analyze_pulse_exit_conditions(df_ind)
                     
                 if exit_analysis:
                     if order["order_type"] == "BUY" and exit_analysis.get("should_exit_buy"):
                         pnl = calc_pnl(order["order_type"], open_price, current_price, order["lot_size"], symbol)
-                        # Exit losing trades immediately on reversal signal
-                        # Exit winning trades only if reversal is confirmed (or immediately for fast 'pulse' scalps)
-                        if pnl <= 0 or trail_stage >= 1 or active_strategy == "pulse":
-                            await close_position(order, current_price, f"Smart Exit BUY: {exit_analysis.get('reason', '')}")
-                            continue
+                        await close_position(order, current_price, f"Smart Market Exit BUY: {exit_analysis.get('reason', '')} (PnL: ${pnl:.2f})")
+                        continue
                     
                     elif order["order_type"] == "SELL" and exit_analysis.get("should_exit_sell"):
                         pnl = calc_pnl(order["order_type"], open_price, current_price, order["lot_size"], symbol)
-                        if pnl <= 0 or trail_stage >= 1 or active_strategy == "pulse":
-                            await close_position(order, current_price, f"Smart Exit SELL: {exit_analysis.get('reason', '')}")
-                            continue
+                        await close_position(order, current_price, f"Smart Market Exit SELL: {exit_analysis.get('reason', '')} (PnL: ${pnl:.2f})")
+                        continue
                 
                 # ── 3C: Dynamic TP Extension (Push TP further when momentum is strong) ──
                 if tp and atr_at_entry and atr_at_entry > 0:

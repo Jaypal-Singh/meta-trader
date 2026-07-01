@@ -138,14 +138,47 @@ def calculate_swing_vp(df, start_idx, end_idx, vp_rows=12):
         "lo": lo,
         "row_h": row_h,
         "volumes": total_volumes.tolist(),
+        "up_volumes": up_volumes.tolist(),
+        "dn_volumes": dn_volumes.tolist()
     }
 
+def get_higher_tf_trend(symbol, current_tf, mt5_module):
+    """
+    Returns the trend direction of a higher timeframe.
+    Returns: 1 for UP, -1 for DOWN, 0 for FLAT
+    """
+    tf_map = {
+        mt5_module.TIMEFRAME_M1: mt5_module.TIMEFRAME_M5,
+        mt5_module.TIMEFRAME_M5: mt5_module.TIMEFRAME_M15,
+        mt5_module.TIMEFRAME_M15: mt5_module.TIMEFRAME_H1,
+        mt5_module.TIMEFRAME_M30: mt5_module.TIMEFRAME_H1,
+        mt5_module.TIMEFRAME_H1: mt5_module.TIMEFRAME_H4,
+        mt5_module.TIMEFRAME_H4: mt5_module.TIMEFRAME_D1,
+        mt5_module.TIMEFRAME_D1: mt5_module.TIMEFRAME_W1
+    }
+    htf = tf_map.get(current_tf)
+    if not htf:
+        return 0
+        
+    df = get_market_data(symbol, htf, 50)
+    if df is None or len(df) < 20:
+        return 0
+        
+    ema_20 = df['close'].ewm(span=20, adjust=False).mean()
+    current_ema = ema_20.iloc[-1]
+    current_close = df['close'].iloc[-1]
+    
+    if current_close > current_ema:
+        return 1
+    elif current_close < current_ema:
+        return -1
+    return 0
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  GUARDEER PRO v2.0 — EXACT PINE SCRIPT TRANSLATION
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def calculate_indicators(df, swing_len=5, tp_mult=2.0, sl_mult=1.0, symbol="XAUUSD"):
+def calculate_indicators(df, swing_len=5, tp_mult=1.0, sl_mult=0.5, symbol="XAUUSD"):
     """
     GUARDEER PRO v2.0 — Exact Pine Script Translation.
     

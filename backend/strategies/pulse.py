@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 
-def calculate_pulse_signals(df, tp_mult=1.5, sl_mult=1.0, symbol="EURUSD"):
+def calculate_pulse_signals(df, tp_mult=1.0, sl_mult=0.5, symbol="EURUSD"):
     """
     PULSE SCALPING ENGINE (Super Fast - M1 / M5 optimized)
     
