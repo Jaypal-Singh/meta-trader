@@ -16,6 +16,9 @@ def init_mt5(account: int, password: str, server: str):
     return True
 
 def get_market_data(symbol: str, timeframe=mt5.TIMEFRAME_H1, num_bars: int = 2000):
+    # Ensure symbol is added to Market Watch, otherwise copy_rates will fail
+    mt5.symbol_select(symbol, True)
+    
     rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, num_bars)
     if rates is None or len(rates) == 0:
         return None

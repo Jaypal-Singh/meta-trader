@@ -286,6 +286,9 @@ async def scan_for_signals():
             if not active_configs:
                 continue
                 
+            # MUST select the symbol in MT5 Market Watch to get live ticks and rates
+            mt5.symbol_select(symbol, True)
+                
             # ── RISK CHECK 3: Max trades per symbol ──
             if not await check_max_trades_per_symbol(username, symbol):
                 continue
