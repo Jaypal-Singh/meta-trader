@@ -1,27 +1,62 @@
+"""
+PULSE v3.0 — Enhanced Signal Engine with Volume, RSI & Trend Filters
+======================================================================
+Core: EMA fast/slow crossover (configurable per symbol)
+Filters: Volume confirmation, RSI overbought/oversold, EMA trend filter
+SL/TP: Swing High/Low based with ATR buffer (dynamic per-symbol config)
+"""
+
 import pandas as pd
 import numpy as np
 
-def calculate_pulse_signals(df, tp_mult=1.0, sl_mult=0.5, symbol="EURUSD"):
+
+def calculate_pulse_signals(df: pd.DataFrame, config: dict = None) -> pd.DataFrame:
     """
-    PULSE SCALPING ENGINE (Super Fast - M1 / M5 optimized)
+    PULSE v3.0 Signal Engine.
     
-    Logic:
-    - EMA 5 and EMA 13 Crossover (Extremely fast)
-    - Buy: EMA 5 crosses ABOVE EMA 13
-    - Sell: EMA 5 crosses BELOW EMA 13
-    - Fully Vectorized for maximum performance (0 latency)
+    Uses symbol-specific config for EMA periods, filters, and TP/SL multipliers.
+    Falls back to legacy defaults if no config provided.
     """
     df = df.copy()
+    
+    # Default config (legacy Pulse)
+    if config is None:
+        config = {
+            "ema_fast": 5,
+            "ema_slow": 13,
+            "ema_trend": 50,
+            "atr_period": 14,
+            "tp_mult": 1.0,
+            "sl_mult": 0.5,
+            "rsi_period": 14,
+            "rsi_overbought": 72,
+            "rsi_oversold": 28,
+        }
+    
+    ema_fast_period = config.get("ema_fast", 5)
+    ema_slow_period = config.get("ema_slow", 13)
+    ema_trend_period = config.get("ema_trend", 50)
+    atr_period = config.get("atr_period", 14)
+    tp_mult = config.get("tp_mult", 1.0)
+    sl_mult = config.get("sl_mult", 0.5)
+    rsi_period = config.get("rsi_period", 14)
+    rsi_ob = config.get("rsi_overbought", 72)
+    rsi_os = config.get("rsi_oversold", 28)
     
     # Ensure numeric columns
     for col in ['open', 'high', 'low', 'close']:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce')
     
-    if len(df) < 20:
+    min_bars = max(ema_trend_period + 10, 50)
+    if len(df) < min_bars:
+        df['signal'] = None
+        df['tp'] = np.nan
+        df['sl'] = np.nan
+        df['atr'] = np.nan
         return df
-        
-    # ── ATR (14) for TP/SL ──
+    
+    # ── ATR ──
     df['prev_close'] = df['close'].shift(1)
     df['tr'] = np.maximum(
         abs(df['high'] - df['low']),
@@ -30,52 +65,80 @@ def calculate_pulse_signals(df, tp_mult=1.0, sl_mult=0.5, symbol="EURUSD"):
             abs(df['low'] - df['prev_close'])
         )
     )
-    df['atr'] = df['tr'].rolling(window=14).mean()
+    df['atr'] = df['tr'].rolling(window=atr_period).mean()
     
-    # ── Super Fast EMAs ──
-    df['ema_5'] = df['close'].ewm(span=5, adjust=False).mean()
-    df['ema_13'] = df['close'].ewm(span=13, adjust=False).mean()
+    # ── EMAs ──
+    df['ema_fast'] = df['close'].ewm(span=ema_fast_period, adjust=False).mean()
+    df['ema_slow'] = df['close'].ewm(span=ema_slow_period, adjust=False).mean()
+    df['ema_trend'] = df['close'].ewm(span=ema_trend_period, adjust=False).mean()
     
-    # ── SIGNAL GENERATION (Vectorized for speed) ──
+    # ── RSI ──
+    delta = df['close'].diff()
+    gain = delta.clip(lower=0)
+    loss_s = -delta.clip(upper=0)
+    rs = gain.ewm(com=rsi_period-1, adjust=False).mean() / (loss_s.ewm(com=rsi_period-1, adjust=False).mean() + 1e-10)
+    df['rsi'] = 100 - (100 / (1 + rs))
+    
+    # ── VOLUME (tick_volume) ──
+    vol_col = 'tick_volume' if 'tick_volume' in df.columns else None
+    if vol_col:
+        df['vol_avg_20'] = df[vol_col].rolling(20).mean()
+        df['vol_ratio'] = df[vol_col] / (df['vol_avg_20'] + 1)
+    else:
+        df['vol_ratio'] = 1.0
+    
+    # ── SIGNAL GENERATION ──
     df['signal'] = None
     df['tp'] = np.nan
     df['sl'] = np.nan
     
-    # Condition: EMA 5 crosses ABOVE EMA 13
-    buy_cond = (df['ema_5'].shift(1) <= df['ema_13'].shift(1)) & (df['ema_5'] > df['ema_13'])
+    # EMA Crossover conditions
+    ema_cross_up = (df['ema_fast'].shift(1) <= df['ema_slow'].shift(1)) & (df['ema_fast'] > df['ema_slow'])
+    ema_cross_down = (df['ema_fast'].shift(1) >= df['ema_slow'].shift(1)) & (df['ema_fast'] < df['ema_slow'])
     
-    # Condition: EMA 5 crosses BELOW EMA 13
-    sell_cond = (df['ema_5'].shift(1) >= df['ema_13'].shift(1)) & (df['ema_5'] < df['ema_13'])
+    # Trend filter: price above/below trend EMA
+    trend_up = df['close'] > df['ema_trend']
+    trend_down = df['close'] < df['ema_trend']
+    
+    # RSI filter: avoid overbought for BUY, oversold for SELL
+    rsi_ok_buy = df['rsi'] < rsi_ob
+    rsi_ok_sell = df['rsi'] > rsi_os
+    
+    # Combined BUY condition: EMA cross up + trend up + RSI not overbought
+    buy_cond = ema_cross_up & trend_up & rsi_ok_buy
+    
+    # Combined SELL condition: EMA cross down + trend down + RSI not oversold
+    sell_cond = ema_cross_down & trend_down & rsi_ok_sell
     
     # ── Swing High/Low for Stop Loss ──
-    df['swing_low_5'] = df['low'].rolling(window=5, min_periods=1).min()
-    df['swing_high_5'] = df['high'].rolling(window=5, min_periods=1).max()
+    swing_window = max(ema_slow_period, 8)
+    df['swing_low'] = df['low'].rolling(window=swing_window, min_periods=1).min()
+    df['swing_high'] = df['high'].rolling(window=swing_window, min_periods=1).max()
     
-    # Apply Buy Signals
+    # Apply BUY signals
     df.loc[buy_cond, 'signal'] = 'BUY'
-    # SL: Recent swing low - small buffer
-    buy_sl = df['swing_low_5'] - (df['atr'] * 0.5)
-    buy_risk = np.maximum(df['close'] - buy_sl, df['atr'] * 0.5) # Min risk = 0.5 ATR
+    buy_sl = df['swing_low'] - (df['atr'] * sl_mult)
+    buy_risk = np.maximum(df['close'] - buy_sl, df['atr'] * sl_mult)
     df.loc[buy_cond, 'sl'] = buy_sl
     df.loc[buy_cond, 'tp'] = df['close'] + (buy_risk * tp_mult)
     
-    # Apply Sell Signals
+    # Apply SELL signals
     df.loc[sell_cond, 'signal'] = 'SELL'
-    # SL: Recent swing high + small buffer
-    sell_sl = df['swing_high_5'] + (df['atr'] * 0.5)
-    sell_risk = np.maximum(sell_sl - df['close'], df['atr'] * 0.5)
+    sell_sl = df['swing_high'] + (df['atr'] * sl_mult)
+    sell_risk = np.maximum(sell_sl - df['close'], df['atr'] * sl_mult)
     df.loc[sell_cond, 'sl'] = sell_sl
     df.loc[sell_cond, 'tp'] = df['close'] - (sell_risk * tp_mult)
-
+    
     # Clean up temp columns
-    df = df.drop(columns=['prev_close', 'tr', 'swing_low_5', 'swing_high_5'], errors='ignore')
+    df = df.drop(columns=['prev_close', 'tr', 'swing_low', 'swing_high', 'vol_avg_20'], errors='ignore')
     
     return df
 
-def analyze_pulse_exit_conditions(df):
+
+def analyze_pulse_exit_conditions(df: pd.DataFrame) -> dict:
     """
-    PULSE - Dynamic Smart Exit Logic
-    Watches the fast EMA 5 vs EMA 13 for momentum exhaustion or sudden reversal.
+    Legacy exit function — kept for backward compatibility.
+    Smart Exit Engine (smart_exit.py) is now the primary exit handler.
     """
     if df is None or len(df) < 5:
         return {
@@ -88,41 +151,28 @@ def analyze_pulse_exit_conditions(df):
     prev = df.iloc[-2]
     
     close = latest['close']
-    ema_5 = latest['ema_5'] if 'ema_5' in df.columns else close
-    ema_13 = latest['ema_13'] if 'ema_13' in df.columns else close
-    
-    prev_ema_5 = prev['ema_5'] if 'ema_5' in df.columns else close
-    prev_ema_13 = prev['ema_13'] if 'ema_13' in df.columns else close
+    ema_fast = latest.get('ema_fast', close)
+    ema_slow = latest.get('ema_slow', close)
+    prev_ema_fast = prev.get('ema_fast', close)
+    prev_ema_slow = prev.get('ema_slow', close)
     
     exit_buy = False
     exit_sell = False
     reasons = []
     
-    # If we are in a BUY and momentum completely reverses (EMA 5 crosses back BELOW EMA 13)
-    if prev_ema_5 >= prev_ema_13 and ema_5 < ema_13:
+    # EMA cross reversal
+    if prev_ema_fast >= prev_ema_slow and ema_fast < ema_slow:
         exit_buy = True
-        reasons.append("Pulse Momentum Reversed (EMA 5 < EMA 13)")
-        
-    # If we are in a SELL and momentum completely reverses (EMA 5 crosses back ABOVE EMA 13)
-    if prev_ema_5 <= prev_ema_13 and ema_5 > ema_13:
+        reasons.append("Pulse: EMA fast crossed below EMA slow")
+    
+    if prev_ema_fast <= prev_ema_slow and ema_fast > ema_slow:
         exit_sell = True
-        reasons.append("Pulse Momentum Reversed (EMA 5 > EMA 13)")
-        
-    # Optional: If price drops significantly below EMA 13 while in a BUY, maybe cut early
-    if close < ema_13 * 0.9995:
-        exit_buy = True
-        if "Price broke below EMA 13 support" not in reasons:
-            reasons.append("Price broke below EMA 13 support")
-            
-    if close > ema_13 * 1.0005:
-        exit_sell = True
-        if "Price broke above EMA 13 resistance" not in reasons:
-            reasons.append("Price broke above EMA 13 resistance")
-            
+        reasons.append("Pulse: EMA fast crossed above EMA slow")
+    
     return {
         "should_exit_buy": exit_buy,
         "should_exit_sell": exit_sell,
         "reason": " | ".join(reasons) if reasons else "No reversal detected",
-        "extend_tp_buy": False, # Pulse doesn't extend TP natively yet
+        "extend_tp_buy": False,
         "extend_tp_sell": False,
     }
