@@ -7,7 +7,16 @@ load_dotenv()
 import certifi
 
 MONGO_URI = os.getenv("MONGO_URI")
-client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI, serverSelectionTimeoutMS=5000, tlsCAFile=certifi.where())
+client = motor.motor_asyncio.AsyncIOMotorClient(
+    MONGO_URI,
+    serverSelectionTimeoutMS=30000,
+    connectTimeoutMS=20000,
+    socketTimeoutMS=20000,
+    retryReads=True,
+    retryWrites=True,
+    readPreference="primaryPreferred",
+    tlsCAFile=certifi.where(),
+)
 db = client.metatrader
 
 users_collection = db.get_collection("users")

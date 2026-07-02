@@ -19,6 +19,7 @@ import random
 import pandas as pd
 import os
 import csv
+from pymongo.errors import ServerSelectionTimeoutError, ConnectionFailure, AutoReconnect
 
 from database import db
 from mt5_logic import get_market_data
@@ -492,6 +493,9 @@ async def auto_trade_loop():
     print(f"[AutoTrade] Banned Symbols: {', '.join(BANNED_SYMBOLS)}")
     print("=" * 60)
     
+    db_retry_delay = 5  # Start with normal delay
+    MAX_DB_RETRY_DELAY = 60  # Cap at 60 seconds
+    
     while True:
         try:
             # 1. Manage existing positions (Smart Exit Engine)
@@ -500,6 +504,16 @@ async def auto_trade_loop():
             # 2. Scan for new signals
             await scan_for_signals()
             
+            # Reset retry delay on success
+            db_retry_delay = 5
+            
+        except (ServerSelectionTimeoutError, ConnectionFailure, AutoReconnect) as e:
+            # MongoDB transient error — use exponential backoff
+            print(f"[AutoTrade] ⚠️ MongoDB connection issue (retrying in {db_retry_delay}s): {e}")
+            await asyncio.sleep(db_retry_delay)
+            db_retry_delay = min(db_retry_delay * 2, MAX_DB_RETRY_DELAY)
+            continue
+            
         except Exception as e:
             print(f"[AutoTrade] Error in loop: {e}")
             import traceback
@@ -507,3 +521,4 @@ async def auto_trade_loop():
             
         # 5 second cycle for fast exit detection
         await asyncio.sleep(5)
+

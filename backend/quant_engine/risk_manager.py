@@ -2,6 +2,7 @@ import asyncio
 from database import db
 from .cache_manager import cache
 from .models import Portfolio
+from pymongo.errors import ServerSelectionTimeoutError, ConnectionFailure, AutoReconnect
 import logging
 
 logger = logging.getLogger(__name__)
@@ -14,6 +15,9 @@ async def risk_monitor_loop():
     from the live trading logic to ensure maximum safety.
     """
     logger.info("Quant Engine: Isolated Risk Monitor Started.")
+    db_retry_delay = 5
+    MAX_DB_RETRY_DELAY = 60
+    
     while True:
         try:
             # 1. Fetch all active portfolios
@@ -53,9 +57,19 @@ async def risk_monitor_loop():
                     logger.critical(f"KILL SWITCH TRIGGERED for Portfolio {portfolio.portfolio_id}! Drawdown: {drawdown_pct}%")
                     # Here we would close all trades for THIS portfolio via MT5 adapter
                     # ...
+            
+            # Reset retry delay on success
+            db_retry_delay = 5
                     
+        except (ServerSelectionTimeoutError, ConnectionFailure, AutoReconnect) as e:
+            logger.warning(f"Quant Engine: MongoDB connection issue (retrying in {db_retry_delay}s): {e}")
+            await asyncio.sleep(db_retry_delay)
+            db_retry_delay = min(db_retry_delay * 2, MAX_DB_RETRY_DELAY)
+            continue
+            
         except Exception as e:
             logger.error(f"Quant Engine Risk Monitor Error: {e}")
             
         # Run every 5 seconds
         await asyncio.sleep(5)
+
