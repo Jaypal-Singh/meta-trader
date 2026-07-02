@@ -262,12 +262,10 @@ def get_chart_data(symbol: str, timeframe: str = "H1", strategy: str = "spirit")
         from strategies.soul import calculate_soul_signals
         df_with_signals = calculate_soul_signals(df_with_signals, symbol=symbol)
     elif strategy == "pulse":
-        if symbol == "GBPUSD" and timeframe.upper() == "M30":
-            from strategies.pulse_gbpusd_m30 import calculate_pulse_gbpusd_m30_signals
-            df_with_signals = calculate_pulse_gbpusd_m30_signals(df_with_signals, tp_mult=1.5, sl_mult=1.0, symbol=symbol)
-        else:
-            from strategies.pulse import calculate_pulse_signals
-            df_with_signals = calculate_pulse_signals(df_with_signals, tp_mult=1.5, sl_mult=1.0, symbol=symbol)
+        from strategies.pulse import calculate_pulse_signals
+        from strategies.symbol_configs import get_config
+        pulse_config = get_config(symbol)
+        df_with_signals = calculate_pulse_signals(df_with_signals, config=pulse_config)
         
     if df_with_signals is None:
         raise HTTPException(status_code=500, detail="Failed to calculate indicators")
@@ -395,12 +393,10 @@ async def get_strategies_performance(username: str = Depends(get_current_user)):
                     from strategies.soul import calculate_soul_signals
                     df_ind = calculate_soul_signals(df_ind, symbol=symbol)
                 elif strategy == "pulse":
-                    if symbol == "GBPUSD" and timeframe_str == "M30":
-                        from strategies.pulse_gbpusd_m30 import calculate_pulse_gbpusd_m30_signals
-                        df_ind = calculate_pulse_gbpusd_m30_signals(df_ind, tp_mult=1.5, sl_mult=1.0, symbol=symbol)
-                    else:
-                        from strategies.pulse import calculate_pulse_signals
-                        df_ind = calculate_pulse_signals(df_ind, tp_mult=1.5, sl_mult=1.0, symbol=symbol)
+                    from strategies.pulse import calculate_pulse_signals
+                    from strategies.symbol_configs import get_config
+                    pulse_config = get_config(symbol)
+                    df_ind = calculate_pulse_signals(df_ind, config=pulse_config)
                     
                 if df_ind is not None:
                     accuracy = calculate_accuracy(df_ind)
