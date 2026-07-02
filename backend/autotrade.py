@@ -506,6 +506,25 @@ async def manage_open_positions():
         # EXIT CHECK 2: Time-Based Exit (stale trades)
         # ════════════════════════════════════════════════════════════
         
+        timeframe_str = order.get("timeframe", "H1")
+        
+        # New: Choppy Market Micro-Profit Exit (Low TF)
+        if timeframe_str in ["M1", "M5", "M15"] and candle_count >= 8:
+            pnl = calc_pnl(order["order_type"], open_price, current_price, order["lot_size"], symbol)
+            if pnl >= 2.00:
+                tf_map = {
+                    "M1": mt5.TIMEFRAME_M1, "M5": mt5.TIMEFRAME_M5, "M15": mt5.TIMEFRAME_M15,
+                    "H1": mt5.TIMEFRAME_H1, "H4": mt5.TIMEFRAME_H4, "D1": mt5.TIMEFRAME_D1
+                }
+                tf = tf_map.get(timeframe_str, mt5.TIMEFRAME_M15)
+                df = get_market_data(symbol, tf, 15)
+                if df is not None and len(df) >= 8:
+                    recent_range = df['high'].iloc[-8:].max() - df['low'].iloc[-8:].min()
+                    # Check if market is choppy (range is small compared to typical ATR at entry)
+                    if atr_at_entry and recent_range < (atr_at_entry * 1.0):
+                        await close_position(order, current_price, f"Choppy Market Micro-Profit Exit (Profit: ${pnl:.2f})")
+                        continue
+        
         if candle_count >= MAX_TRADE_AGE_CANDLES:
             pnl = calc_pnl(order["order_type"], open_price, current_price, order["lot_size"], symbol)
             # Fix: Only time-exit if trade is losing or flat. If it's in a strong winning trend (stage 2+), let trailing stop handle it!
